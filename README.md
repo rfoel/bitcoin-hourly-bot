@@ -42,6 +42,7 @@ pnpm sst secret set FutuurPublicKey  <your-public-key>  --stage production
 pnpm sst secret set FutuurPrivateKey <your-private-key> --stage production
 pnpm sst secret set AnthropicApiKey  <sk-ant-...>       --stage production
 pnpm sst secret set ApiToken "$(openssl rand -hex 32)"  --stage production
+pnpm sst secret set Domain           <dashboard-hostname>  --stage production
 pnpm sst deploy --stage production
 ```
 
@@ -50,17 +51,17 @@ the dashboard and the read endpoints do not need it.
 
 ### Domain
 
-The dashboard's hostname is the `Domain` value — an `sst.Secret` with a placeholder,
-which is how SST holds a per-stage config value that isn't actually secret:
+The dashboard's hostname is the `Domain` value — not a secret, but SST's mechanism for a
+per-stage config value. It has no default, so every stage states its own and a deploy can
+never inherit another stage's DNS record:
 
 ```bash
 pnpm sst secret set Domain bitcoin.example.com --stage production
 ```
 
-Its default is stage-scoped — `bitcoin.rfoel.dev` on `production`, `<stage>.bitcoin.rfoel.dev`
-elsewhere — so a non-production deploy cannot take over production's DNS record by
-inheriting its hostname. The hosted zone must already exist in Route 53 on the same AWS
-account; SST issues the certificate and writes the records.
+`sst deploy` fails with `Set a value for Domain` until it is set. The hosted zone must
+already exist in Route 53 on the same AWS account; SST issues the certificate and writes
+the records.
 
 ## How the agent decides
 

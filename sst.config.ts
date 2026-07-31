@@ -19,14 +19,10 @@ export default $config({
     const apiToken = new sst.Secret("ApiToken");
     const anthropicKey = new sst.Secret("AnthropicApiKey");
 
-    // Not a secret — a Secret with a placeholder is how SST holds a per-stage config
-    // value. Override with `sst secret set Domain <host> --stage <stage>`. The default
-    // is stage-scoped so a non-production deploy cannot take over production's DNS
-    // record by inheriting its hostname.
-    const domain = new sst.Secret(
-      "Domain",
-      $app.stage === "production" ? "bitcoin.rfoel.dev" : `${$app.stage}.bitcoin.rfoel.dev`,
-    );
+    // Not a secret, but SST's per-stage config value. No default on purpose: every
+    // stage states its own hostname, so a deploy can never inherit another stage's
+    // DNS record. Set it with `sst secret set Domain <host> --stage <stage>`.
+    const domain = new sst.Secret("Domain");
 
     const betting = {
       FUTUUR_PUBLIC_KEY: publicKey.value,
