@@ -412,12 +412,13 @@ export function buildTools(context: AgentContext) {
   const writeNote = betaZodTool({
     name: "write_note",
     description:
-      "Save a lesson for future runs. Future you reads these before betting, so write " +
-      "what you would want to know: a rule that held, a threshold that turned out to be " +
-      "noise, a pattern in the settled results. One lesson per note, and say why it " +
-      "mattered. Do not restate what get_history already shows.",
+      "Save one lesson for future runs, in a single sentence. Write the rule, not the " +
+      "story that produced it: \"gaps under $60 at T-10min reverted 3 of 4 times\" beats " +
+      "a paragraph explaining how you noticed. Hard limit of 240 characters — every run " +
+      "reads all of these, so a long note costs tokens on every future run forever. Do " +
+      "not restate what get_history already shows.",
     inputSchema: z.object({
-      text: z.string().min(1),
+      text: z.string().min(1).max(240),
       tags: z.array(z.string()).optional(),
     }),
     run: async ({ text, tags }) => json(await putNote(text, tags ?? [])),

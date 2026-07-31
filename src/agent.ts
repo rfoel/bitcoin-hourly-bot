@@ -15,7 +15,9 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
  */
 const RESERVE_MS = 45_000;
 
-const MODEL = "claude-opus-5";
+// Switchable without a code change, and recorded on every run so cost and win rate
+// can be compared across models rather than argued about.
+const MODEL = process.env.AGENT_MODEL ?? "claude-opus-5";
 
 /**
  * The agent's operating instructions. Kept as one frozen string so it caches —
@@ -93,10 +95,14 @@ Two consequences worth holding onto:
   so make it a claim that can later be judged right or wrong, not a restatement of the
   numbers.
 - Before you finish, write one note if this run taught you something a future run
-  would act on. Skip it if it did not — an obvious note is worse than none.
+  would act on. One sentence, 240 characters, stating the rule rather than the story
+  behind it. Every future run reads every note, so a long one is a cost you pay
+  forever. Skip it entirely if the run taught you nothing — an obvious note is worse
+  than none.
 
-Report what you did in a few sentences: the position, the reason, and what you would
-watch next time. Lead with the outcome.`;
+Close with at most three sentences: what you did, why, and what you would watch next
+time. Lead with the outcome. This is a log line, not a report — no headers, no
+restating the numbers the tools already returned.`;
 
 export const handler = async () => {
   const currency = (process.env.FUTUUR_CURRENCY ?? "OOM") as Currency;

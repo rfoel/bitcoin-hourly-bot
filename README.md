@@ -79,7 +79,7 @@ instead of being cut off mid-thought.
 | `place_bet` | Buy a side; callable more than once to add to a position |
 | `sell` | Sell into the bid book to cut a position or take profit |
 | `cancel_open_orders` | Drop anything that never filled |
-| `write_note` | Save a lesson the next run will read |
+| `write_note` | Save a one-sentence lesson the next run will read (240 char cap) |
 | `wait` | Sleep, then re-read — capped so it can never run past the deadline |
 
 `wait` is what makes the window worth having: the agent can watch the gap at `:46`, hold,
@@ -122,8 +122,21 @@ Deciding costs real dollars; the winnings are play money. Every run records its 
 usage and the USD cost, priced with cache reads at 0.1× input and cache writes at 1.25×
 — a run's bill is not `tokens × base rate`.
 
-Roughly **$0.50 per run** at `effort: high` (~15 turns), so ~$12/day. Levers, cheapest
-first: `AGENT_EFFORT=medium` (~35% less), `claude-sonnet-5`, or a less frequent schedule.
+Measured over the first runs on `claude-opus-5` at `effort: high`: **$0.33 per run**,
+~14 turns, 87% cache hit rate. The split is not what you would guess:
+
+| Line | Share |
+| --- | --- |
+| Cache writes | 38% |
+| Output tokens | 36% |
+| Cache reads | 26% |
+
+Cache *writes* being the largest line is why the growing conversation is worth caching
+anyway — without it those 180k cached-read tokens would bill at full input rate, which is
+several times worse. The lever that moves all three at once is the model, so `AGENT_MODEL`
+is config rather than code and every run records which model produced it. Running
+`claude-sonnet-5` at ~$0.14/run today.
+
 `GET /stats` reports measured `spend` — `avgCostPerRun`, `avgCostPerBet`, and the cache
 hit rate, which is the number to watch if cost drifts up.
 
@@ -164,7 +177,8 @@ Environment defaults live in `sst.config.ts`.
 | `FUTUUR_MAX_STAKE_FRACTION` | `0.05` | Ceiling as a share of the bankroll |
 | `FUTUUR_MIN_STAKE` | `10` | Floor |
 | `FUTUUR_STRATEGY` | `spot` | Used by `POST /bet` and the fallback, not the agent |
-| `AGENT_EFFORT` | `high` | `low` … `max`; the main cost lever |
+| `AGENT_MODEL` | `claude-sonnet-5` | Recorded per run, so models stay comparable |
+| `AGENT_EFFORT` | `high` | `low` … `max`; the cost lever after the model |
 | `AGENT_TOKEN_BUDGET` | `80000` | Task budget the model paces itself against |
 | `AGENT_BUDGET_MS` | `840000` | Working time inside the invocation |
 | `AGENT_MAX_ITERATIONS` | `40` | Hard stop on loop turns |

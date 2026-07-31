@@ -92,6 +92,10 @@ export default $config({
           // Working budget inside the invocation; the handler holds back 45s of the
           // Lambda timeout so it can always finish cleanly.
           AGENT_BUDGET_MS: "840000",
+          // Sonnet 5 reaches near-Opus quality on agentic work at roughly 40% of the
+          // cost. The model is recorded on every run, so switching back is a config
+          // change and the two are comparable on win rate afterwards.
+          AGENT_MODEL: "claude-sonnet-5",
           AGENT_EFFORT: "high",
           AGENT_TOKEN_BUDGET: "250000",
           AGENT_MAX_ITERATIONS: "40",
