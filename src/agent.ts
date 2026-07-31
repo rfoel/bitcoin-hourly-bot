@@ -118,12 +118,21 @@ export const handler = async () => {
     walletBalance(currency).catch(() => null),
   ]);
   const secondsToClose = Math.round((Date.parse(event.bet_end_date!) - Date.now()) / 1000);
+  const budgetSeconds = Math.round((deadline - Date.now()) / 1000);
   const stake = balance === null ? null : stakeFor(balance);
+  // If the market outlives the working budget, any position taken has to survive
+  // unmanaged to resolution — there will be no turn left to sell out of it.
+  const managed = secondsToClose <= budgetSeconds;
 
   const opening =
     `Event #${event.id}: ${event.title}\n` +
     `Closes ${event.bet_end_date} — ${secondsToClose} seconds from now.\n` +
-    `You have ${Math.round((deadline - Date.now()) / 1000)} seconds of working budget.\n` +
+    `You have ${budgetSeconds} seconds of working budget.\n` +
+    (managed
+      ? "Your budget covers the close, so you can manage a position to the end.\n"
+      : `Your budget runs out ${secondsToClose - budgetSeconds}s before the market ` +
+        "closes. Anything you buy has to survive unmanaged to resolution — you will " +
+        "not get a turn to sell out. Size for that, or pass.\n") +
     (balance === null
       ? "Balance unavailable — call get_positions.\n"
       : `Bankroll: ${balance} ${currency}. Default stake ${stake!.amount}, ceiling ~${round2(

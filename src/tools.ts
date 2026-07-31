@@ -274,19 +274,41 @@ export function buildTools(context: AgentContext) {
       const side = sideFor(event, currency, direction as Direction);
       const sized = await sizeOrderFor(side, currency, stake.amount);
 
-      const created = await sdk.createOrder(
-        {
-          market: side.market.id,
-          side: "bid",
-          position: side.position,
-          currency,
-          shares: sized.shares,
-          ...(sized.price === undefined ? {} : { price: sized.price }),
-        },
+      const body = {
+        market: side.market.id,
+        side: "bid" as const,
+        position: side.position,
+        currency,
+        shares: sized.shares,
+        ...(sized.price === undefined ? {} : { price: sized.price }),
+      };
+
+      // The API can answer 200 with status "canceled" and no fill — nothing raises and
+      // nothing is charged. Retry once here rather than spending a model turn on it.
+      let created = await sdk.createOrder(body, {
         // Direction plus a per-call counter, so a second deliberate bet on the same
         // side is not swallowed as a replay of the first.
-        { idempotencyKey: `${event.id}:${side.position}:${context.placed.length}` },
-      );
+        idempotencyKey: `${event.id}:${side.position}:${context.placed.length}:0`,
+      });
+
+      if (created.status === "canceled") {
+        console.warn("order came back canceled, retrying once", { orderId: created.id });
+        await new Promise((resolve) => setTimeout(resolve, 1_500));
+        created = await sdk.createOrder(body, {
+          idempotencyKey: `${event.id}:${side.position}:${context.placed.length}:1`,
+        });
+      }
+
+      if (created.status === "canceled") {
+        return json({
+          placed: false,
+          error: "order canceled by the exchange twice — nothing was charged",
+          direction,
+          requestedShares: sized.shares,
+          limitPrice: sized.price ?? null,
+          hint: "the limit may not be crossing; re-read get_order_book before retrying",
+        });
+      }
 
       context.placed.push({
         orderId: created.id,
@@ -316,18 +338,27 @@ export function buildTools(context: AgentContext) {
         console.error("bet placed but not recorded", error);
       });
 
+      // `filled` is settled; anything else is still working, so the share count is a
+      // request rather than a holding. Say which so it is not read as a fill.
+      const filled = created.status === "filled";
+
       return json({
         placed: true,
+        filled,
         orderId: created.id,
         status: created.status,
         direction,
         position: side.position,
         shares: sized.shares,
+        sharesFilled: created.shares_filled ?? (filled ? sized.shares : 0),
         limitPrice: sized.price ?? null,
         estimatedCost: sized.estimatedCost,
         requestedAmount: amount,
         clamped: stake.reason,
         secondsToClose: secondsToClose(event),
+        ...(filled
+          ? {}
+          : { note: "still working on the book — confirm with get_positions before adding" }),
       });
     },
   });
