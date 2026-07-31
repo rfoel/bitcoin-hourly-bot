@@ -1,0 +1,4 @@
+# futuur is a first-party package published from ~/Developer/futuur, so the
+# release-age gate that protects against fresh third-party releases is noise here.
+minimumReleaseAgeExclude:
+  - futuur

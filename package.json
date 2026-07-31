@@ -1,0 +1,28 @@
+{
+  "name": "bitcoin-hourly-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "private": "true",
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.162",
+    "@types/node": "^26.1.2",
+    "sst": "^4.17.1",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.115.0",
+    "@aws-sdk/client-dynamodb": "^3.1098.0",
+    "@aws-sdk/lib-dynamodb": "^3.1098.0",
+    "futuur": "^2.1.1",
+    "zod": "^4.4.3"
+  },
+  "packageManager": "pnpm@11.8.0"
+}

@@ -1,0 +1,8 @@
+node_modules/
+.sst/
+sst-env.d.ts
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
