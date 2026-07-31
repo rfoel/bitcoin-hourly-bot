@@ -50,15 +50,17 @@ the dashboard and the read endpoints do not need it.
 
 ### Domain
 
-`DOMAIN` at the top of `sst.config.ts` is the dashboard's custom domain, applied on the
-`production` stage only — other stages get the generated API Gateway URL so they never
-compete for the same DNS record. The hosted zone must already exist in Route 53 on the
-same AWS account; SST issues the certificate and writes the records.
+The dashboard's hostname is the `Domain` value — an `sst.Secret` with a placeholder,
+which is how SST holds a per-stage config value that isn't actually secret:
 
 ```bash
-DOMAIN=bitcoin.example.com pnpm sst deploy --stage production   # fork it elsewhere
-DOMAIN= pnpm sst deploy --stage production                      # skip the custom domain
+pnpm sst secret set Domain bitcoin.example.com --stage production
 ```
+
+Its default is stage-scoped — `bitcoin.rfoel.dev` on `production`, `<stage>.bitcoin.rfoel.dev`
+elsewhere — so a non-production deploy cannot take over production's DNS record by
+inheriting its hostname. The hosted zone must already exist in Route 53 on the same AWS
+account; SST issues the certificate and writes the records.
 
 ## How the agent decides
 

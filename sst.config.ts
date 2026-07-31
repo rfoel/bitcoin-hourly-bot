@@ -1,13 +1,5 @@
 /// <reference path="./.sst/platform/config.d.ts" />
 
-/**
- * Custom domain for the dashboard, applied on the production stage only — other
- * stages get the generated API Gateway URL so they never fight over DNS. Set
- * `DOMAIN` to point a fork somewhere else, or `DOMAIN=""` to skip the custom
- * domain entirely. The zone must already exist in Route 53 on the same account.
- */
-const DOMAIN = process.env.DOMAIN ?? "bitcoin.rfoel.dev";
-
 export default $config({
   app(input) {
     return {
@@ -26,6 +18,15 @@ export default $config({
     // Shared secret for the on-demand endpoint. Without it the API rejects everything.
     const apiToken = new sst.Secret("ApiToken");
     const anthropicKey = new sst.Secret("AnthropicApiKey");
+
+    // Not a secret — a Secret with a placeholder is how SST holds a per-stage config
+    // value. Override with `sst secret set Domain <host> --stage <stage>`. The default
+    // is stage-scoped so a non-production deploy cannot take over production's DNS
+    // record by inheriting its hostname.
+    const domain = new sst.Secret(
+      "Domain",
+      $app.stage === "production" ? "bitcoin.rfoel.dev" : `${$app.stage}.bitcoin.rfoel.dev`,
+    );
 
     const betting = {
       FUTUUR_PUBLIC_KEY: publicKey.value,
@@ -125,10 +126,8 @@ export default $config({
       },
     });
 
-    const useDomain = DOMAIN !== "" && $app.stage === "production";
-
     const api = new sst.aws.ApiGatewayV2("BetApi", {
-      ...(useDomain ? { domain: { name: DOMAIN, dns: sst.aws.dns() } } : {}),
+      domain: { name: domain.value, dns: sst.aws.dns() },
       cors: false,
     });
 
