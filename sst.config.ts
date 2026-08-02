@@ -103,9 +103,10 @@ export default $config({
           AGENT_EFFORT: "high",
           AGENT_TOKEN_BUDGET: "250000",
           AGENT_MAX_ITERATIONS: "40",
-          // Deterministic spot bet if the agent loop itself fails. A run that
-          // deliberately passes does not trigger it.
-          AGENT_FALLBACK: "true",
+          // Off. The spot rule it falls back to has run -19% ROI over 38 bets, so a
+          // failed agent betting anyway costs more than a skipped hour, which costs
+          // nothing.
+          AGENT_FALLBACK: "false",
         },
         link: [memory],
         ...runtime,

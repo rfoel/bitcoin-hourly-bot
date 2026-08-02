@@ -95,10 +95,14 @@ The model proposes; the code clamps.
   ceiling returns the ceiling, not an error.
 - **`retries: 0`** on the cron. A retry would re-enter a window the first attempt may
   already have bet in.
-- **Fallback** — if the loop itself fails (API down, a classifier refusal), a
-  deterministic spot bet goes in. A run that *deliberately passes* does not trigger it.
-- **`fallbacks: "default"`** on the request, so a refusal is re-run on Anthropic's
-  recommended fallback model rather than silently costing the hour.
+- **No fallback bet.** `AGENT_FALLBACK` is off: the deterministic spot rule it used to
+  fall back to has run **-19% ROI over 38 bets**, so a failed agent betting anyway costs
+  more than a skipped hour, which costs nothing.
+- **`fallbacks: "default"`** only on models that accept it. Sonnet 5 rejects the
+  parameter with a 400 — sending it unconditionally failed every run for two days.
+- **Failures are recorded**, so a broken run shows as `FAILED` rather than `PASSED`, and
+  a streak of identical outcomes raises a banner. A fault that renders as normal
+  operation is the expensive kind.
 
 ## Bankroll sizing
 
@@ -139,6 +143,13 @@ is config rather than code and every run records which model produced it. Runnin
 
 `GET /stats` reports measured `spend` — `avgCostPerRun`, `avgCostPerBet`, and the cache
 hit rate, which is the number to watch if cost drifts up.
+
+## Reading the numbers
+
+**ROI on stake, not win rate.** In a market where a 0.95 favourite pays 5%, win rate is
+not a result. The spot rule went 8W-1L on the Up side for **+1.6%** — 89% right and
+barely above break-even, because winning at 0.95 earns 0.05 and losing costs 0.95. The
+dashboard leads with ROI for that reason and keeps win rate as a sub-line.
 
 ## Dashboard
 

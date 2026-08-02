@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { Currency } from "futuur";
 
 import { placeBet, resolveEvent, stakeFor, walletBalance } from "./bet.js";
-import { costOf, listNotes, recordRun } from "./store.js";
+import { costOf, listNotes, listRuns, recordRun, summariseSpend } from "./store.js";
 import type { TokenUsage } from "./store.js";
 import { buildTools } from "./tools.js";
 import type { AgentContext } from "./tools.js";
@@ -18,6 +18,14 @@ const RESERVE_MS = 45_000;
 // Switchable without a code change, and recorded on every run so cost and win rate
 // can be compared across models rather than argued about.
 const MODEL = process.env.AGENT_MODEL ?? "claude-opus-5";
+
+/**
+ * Models that accept the server-side `fallbacks` parameter. Sonnet 5 rejects it with
+ * a 400, which failed every run for two days while the deterministic fallback quietly
+ * kept betting — so this is an allowlist, not a guess.
+ */
+const SUPPORTS_FALLBACKS = new Set(["claude-opus-5", "claude-fable-5", "claude-mythos-5"]);
+const useFallbacks = SUPPORTS_FALLBACKS.has(MODEL);
 
 /**
  * The agent's operating instructions. Kept as one frozen string so it caches —
@@ -160,8 +168,11 @@ export const handler = async () => {
     },
     // A safety classifier can decline a request; this re-runs it on Anthropic's
     // recommended fallback instead of returning a refusal and betting nothing.
-    fallbacks: "default",
-    betas: ["task-budgets-2026-03-13", "server-side-fallback-2026-07-01"],
+    ...(useFallbacks ? { fallbacks: "default" as const } : {}),
+    betas: [
+      "task-budgets-2026-03-13",
+      ...(useFallbacks ? ["server-side-fallback-2026-07-01"] : []),
+    ],
     // Caches the growing conversation, not just the system prompt. Every turn resends
     // the whole history, so without this the same tool results are re-billed at full
     // price on each of the run's ~15 turns.
@@ -205,6 +216,11 @@ export const handler = async () => {
   const stalled = failed !== null || final?.stop_reason === "refusal" || summary.length === 0;
   const fallback = context.placed.length === 0 && stalled ? await fallbackBet(context) : null;
 
+  const fallbackOrderId =
+    fallback && typeof fallback === "object" && "orderId" in fallback
+      ? (fallback as { orderId?: number }).orderId
+      : undefined;
+
   const run = await recordRun({
     eventId: event.id,
     betEndDate: event.bet_end_date!,
@@ -212,9 +228,15 @@ export const handler = async () => {
     effort: process.env.AGENT_EFFORT ?? "high",
     iterations,
     usage,
-    orderIds: context.placed.map((p) => p.orderId),
+    // The fallback's order belongs to the run too. Leaving it out is what made 37
+    // broken runs render as deliberate passes on the dashboard.
+    orderIds: [
+      ...context.placed.map((p) => p.orderId),
+      ...(fallbackOrderId === undefined ? [] : [fallbackOrderId]),
+    ],
     stopReason: final?.stop_reason ?? (failed ? "error" : null),
     summary,
+    error: describeFailure(failed, final),
   }).catch((error: unknown) => {
     console.error("run not recorded", error);
     return null;
@@ -229,8 +251,48 @@ export const handler = async () => {
     stopReason: final?.stop_reason,
   });
 
+  await checkStreak().catch(() => undefined);
+
   return finish(context, final, fallback, summary, run?.costUsd ?? costOf(MODEL, usage), usage);
 };
+
+/**
+ * A one-line reason the run did not complete, or null when it did. Recorded so a
+ * broken run can never be read as a pass.
+ */
+function describeFailure(
+  failed: unknown,
+  final: Anthropic.Beta.BetaMessage | null,
+): string | null {
+  if (failed !== null && failed !== undefined) {
+    return failed instanceof Error ? failed.message : String(failed);
+  }
+  if (final?.stop_reason === "refusal") {
+    return `refused (${final.stop_details?.category ?? "no category"})`;
+  }
+  if (final === null) return "loop produced no message";
+  return null;
+}
+
+/**
+ * Repeated identical outcomes are the failure mode that hides: 37 runs in a row that
+ * all "passed" were 37 crashes. Logged at error level so it can carry an alarm.
+ */
+async function checkStreak(): Promise<void> {
+  const spend = summariseSpend(await listRuns(40));
+  if (!spend.streak || spend.streak.runs < 3) return;
+
+  const message = `${spend.streak.runs} runs in a row ${spend.streak.outcome}`;
+  if (spend.streak.outcome === "bet") {
+    console.log(message);
+    return;
+  }
+  console.error(`STREAK: ${message} — this is usually a fault, not a strategy`, {
+    outcome: spend.streak.outcome,
+    runs: spend.streak.runs,
+    failures: spend.failures,
+  });
+}
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -256,7 +318,7 @@ function addUsage(totals: TokenUsage, usage: Anthropic.Beta.BetaUsage): void {
  * is worse than no bet when nothing reasoned about it.
  */
 async function fallbackBet(context: AgentContext) {
-  if ((process.env.AGENT_FALLBACK ?? "true") !== "true") {
+  if ((process.env.AGENT_FALLBACK ?? "false") !== "true") {
     console.warn("agent produced no bet and fallback is disabled");
     return null;
   }

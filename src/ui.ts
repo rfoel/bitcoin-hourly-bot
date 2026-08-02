@@ -67,6 +67,10 @@ export function renderPage(state: DashboardState): string {
   .row .k { display: inline-block; min-width: 9ch; }
   .why { color: var(--dim); margin-top: .3rem; white-space: pre-wrap; }
   .empty { color: var(--dim); }
+  .alert {
+    border: 1px solid; border-radius: 2px; padding: .5rem .75rem;
+    margin-bottom: 1.25rem; color: var(--fg);
+  }
   table { border-collapse: collapse; width: 100%; }
   td, th { text-align: left; padding: .1rem 1.25rem .1rem 0; font-weight: 400; }
   th { color: var(--dim); }
@@ -78,6 +82,7 @@ export function renderPage(state: DashboardState): string {
   <h1>BITCOIN HOURLY — CLAUDE ON FUTUUR</h1>
   <div class="sub">${esc(state.now)} · refreshes every 30s · <a href="/state">json</a></div>
 
+  ${renderAlert(state)}
   ${renderHeadline(state)}
   <hr>
   ${renderBreakdowns(state)}
@@ -92,6 +97,33 @@ export function renderPage(state: DashboardState): string {
 </html>`;
 }
 
+/**
+ * A run of identical outcomes is the failure mode that hides: 37 runs that all read
+ * as "passed" were 37 crashes that bet anyway. Surface it above everything else.
+ */
+function renderAlert(state: DashboardState): string {
+  const { streak, failures } = state.spend;
+  if (!streak || streak.outcome === "bet" || streak.runs < 3) return "";
+
+  const failing = streak.outcome === "failed";
+  return `<div class="alert" style="border-color:${failing ? "var(--loss)" : "var(--pending)"}">
+    <strong style="color:${failing ? "var(--loss)" : "var(--pending)"}">${
+      failing ? "BROKEN" : "IDLE"
+    }</strong>
+    — the last ${streak.runs} runs all ${esc(streak.outcome)}${
+      failing ? `, ${failures} of the recent window` : ""
+    }. ${
+      failing
+        ? "The loop is not reaching a decision; check the agent log."
+        : "Nothing has met the bar to bet. Real if the market is efficient, a fault if not."
+    }
+  </div>`;
+}
+
+/**
+ * Win rate answers "how often", ROI answers "did it make money" — in a market where a
+ * 0.95 favourite pays 5%, only the second is a result. Win rate stays as a sub-line.
+ */
 function renderHeadline(state: DashboardState): string {
   const { stats, spend, balance, currency } = state;
   const net = stats.earnings;
@@ -109,9 +141,13 @@ function renderHeadline(state: DashboardState): string {
       <div class="k">${stats.won + stats.lost} settled</div>
     </div>
     <div>
-      <div class="k">WIN RATE</div>
-      <div class="v big">${stats.winRate === null ? "—" : `${Math.round(stats.winRate * 100)}%`}</div>
-      <div class="k">${stats.won}W · ${stats.lost}L · ${stats.pending}P</div>
+      <div class="k">ROI ON STAKE</div>
+      <div class="v big" style="color:${(stats.roi ?? 0) >= 0 ? "var(--win)" : "var(--loss)"}">${
+        stats.roi === null ? "—" : `${signed(stats.roi * 100)}%`
+      }</div>
+      <div class="k">${stats.won}W · ${stats.lost}L · ${
+        stats.winRate === null ? "—" : `${Math.round(stats.winRate * 100)}%`
+      } win rate</div>
     </div>
     <div>
       <div class="k">DECISION COST</div>
@@ -120,7 +156,7 @@ function renderHeadline(state: DashboardState): string {
     </div>
   </div>
   <div class="grid" style="margin-top:.9rem">
-    <div><span class="k">STAKED</span> <span class="v">${num(stats.staked)}</span></div>
+    <div><span class="k">STAKED</span> <span class="v">${num(stats.settledStaked)}</span></div>
     <div><span class="k">$/RUN</span> <span class="v">${spend.avgCostPerRun.toFixed(4)}</span></div>
     <div><span class="k">$/BET</span> <span class="v">${spend.avgCostPerBet.toFixed(4)}</span></div>
     <div><span class="k">CACHE</span> <span class="v">${
@@ -178,8 +214,11 @@ function renderTimeline(state: DashboardState): string {
 }
 
 function renderRun(run: RunRecord, bets: BetRecord[]): string {
-  const passed = run.orderIds.length === 0;
-  const worst = bets.some((b) => b.status === "lost")
+  const failed = Boolean(run.error);
+  const passed = !failed && run.orderIds.length === 0;
+  const worst = failed
+    ? "lost"
+    : bets.some((b) => b.status === "lost")
     ? "lost"
     : bets.some((b) => b.status === "won")
       ? "won"
@@ -190,14 +229,21 @@ function renderRun(run: RunRecord, bets: BetRecord[]): string {
   return `<div class="card ${worst}">
     <div class="head">
       <span class="ts">${esc(run.runAt.replace("T", " ").slice(0, 19))}Z</span>
-      <span class="tag" style="color:${passed ? "var(--dim)" : "var(--accent)"}">${
-        passed ? "PASSED" : `${run.orderIds.length} BET${run.orderIds.length > 1 ? "S" : ""}`
+      <span class="tag" style="color:${
+        failed ? "var(--loss)" : passed ? "var(--dim)" : "var(--accent)"
+      }">${
+        failed
+          ? "FAILED"
+          : passed
+            ? "PASSED"
+            : `${run.orderIds.length} BET${run.orderIds.length > 1 ? "S" : ""}`
       }</span>
       <span class="ts">event #${run.eventId} · closes ${esc(run.betEndDate.slice(11, 16))}Z</span>
     </div>
     <div class="row"><span class="k">cost</span>$${run.costUsd.toFixed(4)} · ${run.iterations} turns · ${
       run.usage.output
     } out / ${run.usage.input + run.usage.cacheRead + run.usage.cacheWrite} in · ${esc(run.effort)}</div>
+    ${run.error ? `<div class="row" style="color:var(--loss)"><span class="k">error</span>${esc(run.error)}</div>` : ""}
     ${run.summary ? `<div class="why">${esc(run.summary)}</div>` : ""}
     ${bets.map((bet) => renderBet(bet, false)).join("")}
   </div>`;

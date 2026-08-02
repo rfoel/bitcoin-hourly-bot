@@ -97,10 +97,12 @@ export interface RunRecord {
   usage: TokenUsage;
   /** USD, from the price table above. */
   costUsd: number;
-  /** Order IDs placed during the run; empty means the agent passed. */
+  /** Order IDs placed during the run. Empty with no error means a deliberate pass. */
   orderIds: number[];
   stopReason: string | null;
   summary: string;
+  /** Set when the loop itself failed, so a broken run never reads as a pass. */
+  error?: string | null;
 }
 
 /** USD cost of one run, with cache reads and writes priced separately. */
@@ -255,6 +257,10 @@ export interface Stats {
   lost: number;
   winRate: number | null;
   staked: number;
+  /** Staked on settled bets only — the denominator ROI is meaningful against. */
+  settledStaked: number;
+  /** Earnings over settled stake. Win rate hides price; this does not. */
+  roi: number | null;
   earnings: number;
   /** Per strategy, then per direction — this is what tells you what works. */
   byStrategy: Record<string, { settled: number; won: number; earnings: number }>;
@@ -269,6 +275,8 @@ export function summarise(bets: BetRecord[]): Stats {
     lost: 0,
     winRate: null,
     staked: 0,
+    settledStaked: 0,
+    roi: null,
     earnings: 0,
     byStrategy: {},
     byDirection: {},
@@ -285,6 +293,7 @@ export function summarise(bets: BetRecord[]): Stats {
     const won = bet.status === "won";
     // A loss forfeits the stake; a win reports its own earnings.
     const earnings = won ? (bet.earnings ?? 0) : -bet.estimatedCost;
+    stats.settledStaked = round2(stats.settledStaked + bet.estimatedCost);
 
     stats[won ? "won" : "lost"] += 1;
     stats.earnings = round2(stats.earnings + earnings);
@@ -295,6 +304,8 @@ export function summarise(bets: BetRecord[]): Stats {
 
   const settled = stats.won + stats.lost;
   stats.winRate = settled === 0 ? null : round2(stats.won / settled);
+  stats.roi =
+    stats.settledStaked === 0 ? null : round4(stats.earnings / stats.settledStaked);
   return stats;
 }
 
@@ -310,6 +321,14 @@ export interface Spend {
   usage: TokenUsage;
   /** Share of input tokens served from cache; low means the prefix is churning. */
   cacheHitRate: number | null;
+  /** Runs whose loop failed outright. */
+  failures: number;
+  /**
+   * How many of the most recent runs share one outcome, and which. A long streak of
+   * either is a signal: repeated failure is a broken deploy, repeated passing is a
+   * strategy that never fires. Both look like "nothing happening" on a dashboard.
+   */
+  streak: { outcome: "failed" | "passed" | "bet"; runs: number } | null;
 }
 
 export function summariseSpend(runs: RunRecord[]): Spend {
@@ -323,7 +342,9 @@ export function summariseSpend(runs: RunRecord[]): Spend {
     costUsd += run.costUsd;
     iterations += run.iterations;
     orders += run.orderIds.length;
-    if (run.orderIds.length === 0) passes += 1;
+    // A pass is a decision not to bet. A run that crashed placed nothing either, but
+    // counting it as a pass is exactly how 38 failures read as normal operation.
+    if (run.orderIds.length === 0 && !run.error) passes += 1;
 
     usage.input += run.usage.input;
     usage.output += run.usage.output;
@@ -336,6 +357,8 @@ export function summariseSpend(runs: RunRecord[]): Spend {
   return {
     runs: runs.length,
     passes,
+    failures: runs.filter((run) => run.error).length,
+    streak: streakOf(runs),
     costUsd: round4(costUsd),
     avgCostPerRun: runs.length === 0 ? 0 : round4(costUsd / runs.length),
     avgCostPerBet: orders === 0 ? 0 : round4(costUsd / orders),
@@ -347,6 +370,22 @@ export function summariseSpend(runs: RunRecord[]): Spend {
 
 function round4(value: number): number {
   return Math.round(value * 10_000) / 10_000;
+}
+
+/** `runs` arrives newest-first, so the streak is however far the head repeats. */
+function streakOf(runs: RunRecord[]): Spend["streak"] {
+  if (runs.length === 0) return null;
+
+  const outcomeOf = (run: RunRecord) =>
+    run.error ? "failed" : run.orderIds.length === 0 ? "passed" : ("bet" as const);
+
+  const outcome = outcomeOf(runs[0]!);
+  let count = 0;
+  for (const run of runs) {
+    if (outcomeOf(run) !== outcome) break;
+    count += 1;
+  }
+  return { outcome: outcome as "failed" | "passed" | "bet", runs: count };
 }
 
 function bucket(
