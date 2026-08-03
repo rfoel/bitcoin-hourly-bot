@@ -144,6 +144,19 @@ is config rather than code and every run records which model produced it. Runnin
 `GET /stats` reports measured `spend` — `avgCostPerRun`, `avgCostPerBet`, and the cache
 hit rate, which is the number to watch if cost drifts up.
 
+### The chart
+
+One round is one hourly market. Per-round result and running total are **two panels, not
+two lines**: both are OOMs, but per-round swings ±200 while the total climbs past 900, so
+one shared axis flattens the per-round line into noise — and a second y-scale would be a
+dual-axis chart, which invents a correlation that is not in the data.
+
+Series colours are slots 1 and 2 of a fixed categorical order, validated against this
+dashboard's own surface rather than eyeballed: lightness band, chroma floor, ΔE 26.8
+under protanopia, and 3:1 contrast all pass. One series per panel, so neither needs a
+legend — the caption names it. Every point carries a tooltip, with the hit target wider
+than the mark.
+
 ## Reading the numbers
 
 **ROI on stake, not win rate.** In a market where a 0.95 favourite pays 5%, win rate is
@@ -154,8 +167,9 @@ dashboard leads with ROI for that reason and keeps win rate as a sub-line.
 ## Dashboard
 
 `GET /` is server-rendered HTML with no JavaScript, refreshing itself every 30 seconds.
-It shows the bankroll, net settled, win rate and decision cost, then results broken down
-by direction and strategy, then a timeline of receipts — each run with its cost, turn
+It shows the bankroll, net settled, ROI and decision cost, then **P&L by round** — two
+line panels, x is the round number and y is OOMs — then results broken down by direction
+and strategy, then a timeline of receipts — each run with its cost, turn
 count and summary, and each bet nested underneath with the reasoning that produced it.
 Runs where Claude passed appear too, so you can see what it decided *not* to do.
 
