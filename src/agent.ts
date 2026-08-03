@@ -1,7 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
-import type { Currency } from "futuur";
+import type { Currency, FuturEvent } from "futuur";
 
-import { placeBet, resolveEvent, stakeFor, walletBalance } from "./bet.js";
+import { fetchBtcSpot, listSides, parsePriceToBeat, placeBet, priceOf, resolveEvent, sdk, stakeFor, walletBalance } from "./bet.js";
+import { edges, fairValue, realisedVolatility } from "./edge.js";
 import { costOf, listNotes, listRuns, recordRun, summariseSpend } from "./store.js";
 import type { TokenUsage } from "./store.js";
 import { buildTools } from "./tools.js";
@@ -67,11 +68,20 @@ fee. Say so plainly and finish.
 
 ## How to work the window
 
-You have time, so use it: read the market and your own history, form a view, and then
-decide whether to act now or wait for the price to move toward you. \`wait\` lets you
-watch the gap develop and re-check closer to resolution, where the signal is strongest.
+The market, both order books, the spot price and a computed fair value are already in
+the opening message. Re-reading them costs a round trip you may want later, so call
+\`get_market\` or \`get_order_book\` again only if you waited, or if you need depth past
+the top levels.
+
 You can add to a position, and you can \`sell\` out of one when the move goes against
-you rather than riding it to zero.
+you rather than riding it to zero. \`wait\` still exists, but the window is short now —
+budget for two or three turns, not ten.
+
+The fair value is an anchor, not an instruction. It assumes a driftless walk with
+volatility read off the trailing hour, so it is most confident exactly when a real move
+is starting: a 60-point disagreement with the book usually means the estimate is stale,
+not that the market is asleep. Treat a large edge as a reason to look harder at the
+book and the clock, and disagree with it when the tape says otherwise.
 
 Before your first bet of the run, read get_history. Your settled results are the only
 evidence you have about whether your reasoning has been working, and the notes are what
@@ -121,9 +131,16 @@ export const handler = async () => {
   const context: AgentContext = { currency, deadline, event, placed: [] };
   const tools = buildTools(context);
 
-  const [notes, balance] = await Promise.all([
+  // Front-loaded rather than left to tool calls. Reading the market, the spot price and
+  // both books used to cost three round trips of ~48s each before the model could form
+  // a view; handing it the same data up front is most of the cost of a run.
+  const [notes, balance, briefing] = await Promise.all([
     listNotes(20).catch(() => []),
     walletBalance(currency).catch(() => null),
+    brief(event, currency).catch((error: unknown) => {
+      console.warn("briefing failed, the model will have to use its tools", error);
+      return null;
+    }),
   ]);
   const secondsToClose = Math.round((Date.parse(event.bet_end_date!) - Date.now()) / 1000);
   const budgetSeconds = Math.round((deadline - Date.now()) / 1000);
@@ -147,6 +164,7 @@ export const handler = async () => {
           balance * Number(process.env.FUTUUR_MAX_STAKE_FRACTION ?? "0.05"),
         )}.\n`) +
     "\n" +
+    (briefing === null ? "" : `\n${briefing}\n`) +
     (notes.length === 0
       ? "No notes from previous runs yet.\n"
       : `Notes from previous runs, newest first:\n${notes
@@ -255,6 +273,63 @@ export const handler = async () => {
 
   return finish(context, final, fallback, summary, run?.costUsd ?? costOf(MODEL, usage), usage);
 };
+
+/**
+ * The market, both books, the spot price and a computed fair value, as text. The fair
+ * value is an anchor, not an instruction — it is a driftless-walk estimate off trailing
+ * volatility, so it is confident exactly where a real move is starting.
+ */
+async function brief(event: FuturEvent, currency: Currency): Promise<string> {
+  const priceToBeat = parsePriceToBeat(event);
+  const secondsLeft = Math.round((Date.parse(event.bet_end_date!) - Date.now()) / 1000);
+  const currencyMode = currency === "OOM" ? "play_money" : "real_money";
+
+  const sides = listSides(event.markets, currency).map((side) => ({
+    direction: /\bdown\b/i.test(side.label) ? ("down" as const) : ("up" as const),
+    side,
+  }));
+
+  const [spot, vol, ...books] = await Promise.all([
+    fetchBtcSpot(),
+    realisedVolatility(),
+    ...sides.map((s) =>
+      sdk
+        .getOrderBook(s.side.market.id, { currency_mode: currencyMode, position: s.side.position })
+        .catch(() => null),
+    ),
+  ]);
+
+  const asks: { up: number | null; down: number | null } = { up: null, down: null };
+  const depth: string[] = [];
+  sides.forEach((s, i) => {
+    const book = books[i];
+    asks[s.direction] = book?.ask?.[0]?.price ?? null;
+    depth.push(
+      `  ${s.direction.padEnd(4)} display ${priceOf(s.side, currency)} · ` +
+        `ask ${(book?.ask ?? []).slice(0, 3).map((l) => `${l.price}x${Math.floor(l.total_shares)}`).join(" ") || "empty"} · ` +
+        `bid ${(book?.bid ?? []).slice(0, 3).map((l) => `${l.price}x${Math.floor(l.total_shares)}`).join(" ") || "empty"}`,
+    );
+  });
+
+  const value = fairValue(spot.price, priceToBeat, secondsLeft, vol);
+  const lines = edges(value, asks).map(
+    (e) =>
+      `  ${e.direction.padEnd(4)} fair ${e.fair.toFixed(2)} · ask ${
+        e.ask === null ? "—" : e.ask.toFixed(2)
+      } · edge ${e.edge === null ? "—" : (e.edge >= 0 ? "+" : "") + e.edge.toFixed(2)}`,
+  );
+
+  return [
+    `Price to beat ${priceToBeat}. Spot ${spot.price} (${spot.source}), ${
+      spot.price >= priceToBeat ? "above" : "below"
+    } by ${Math.abs(spot.price - priceToBeat).toFixed(2)}. ${secondsLeft}s to close.`,
+    `Book:`,
+    ...depth,
+    `Computed fair value — driftless walk, sigma ${value.sigmaAnnual} annualised from ${value.samples} 1m candles, ${value.sigmasAway} sigma from the line:`,
+    ...lines,
+    `That estimate is backward-looking: it reads a starting move as impossible, so treat a huge edge as a reason to look closer rather than a reason to size up.`,
+  ].join("\n");
+}
 
 /**
  * A one-line reason the run did not complete, or null when it did. Recorded so a

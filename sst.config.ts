@@ -76,11 +76,13 @@ export default $config({
     // invocation spans the whole window, so `wait` is a real move — it can watch the
     // gap develop and act closer to resolution, where the signal is strongest.
     //
-    // 15 minutes is the Lambda ceiling, which is why the window starts at :45.
+    // :53 rather than :45. Measured runs take 223-628s (median 335s) and never call
+    // `wait`, so the wide window was idle time — and the bets that actually carry the
+    // P&L land latest, where the book has had time to misprice a drifting spot.
     // `retries: 0` on purpose: a retry would re-enter a window the first attempt may
-    // already have bet in, and the agent has its own fallback for a failed loop.
+    // already have bet in.
     const cron = new sst.aws.CronV2("HourlyBitcoinBet", {
-      schedule: "cron(45 * * * ? *)",
+      schedule: "cron(53 * * * ? *)",
       timezone: "UTC",
       retries: 0,
       dlq: dlq.arn,
@@ -91,11 +93,11 @@ export default $config({
           ANTHROPIC_API_KEY: anthropicKey.value,
           // Working budget inside the invocation; the handler holds back 45s of the
           // Lambda timeout so it can always finish cleanly.
-          AGENT_BUDGET_MS: "840000",
+          AGENT_BUDGET_MS: "375000",
           // Narrower than the shared 70: the cron fires at :45, so the only event it
           // should ever pick is the one closing at the top of this hour. A 70-minute
           // window lets it land on a market an hour out that it cannot see through.
-          FUTUUR_WINDOW_MINUTES: "25",
+          FUTUUR_WINDOW_MINUTES: "15",
           // Sonnet 5 reaches near-Opus quality on agentic work at roughly 40% of the
           // cost. The model is recorded on every run, so switching back is a config
           // change and the two are comparable on win rate afterwards.
@@ -110,7 +112,7 @@ export default $config({
         },
         link: [memory],
         ...runtime,
-        timeout: "15 minutes",
+        timeout: "7 minutes",
         memory: "512 MB",
       },
     });
