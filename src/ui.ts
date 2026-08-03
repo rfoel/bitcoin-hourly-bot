@@ -74,10 +74,6 @@ export function renderPage(state: DashboardState): string {
   }
   figure.chart { margin: 0 0 1.5rem; }
   figure.chart figcaption { color: var(--dim); margin-bottom: .5rem; }
-  .swatch {
-    display: inline-block; width: 8px; height: 8px; border-radius: 2px;
-    margin: 0 .3rem 0 .1rem; vertical-align: baseline;
-  }
   .chart .grid { stroke: var(--rule); stroke-width: 1; }
   .chart .zero { stroke: var(--dim); stroke-width: 1; stroke-dasharray: 3 3; }
   .chart .tick { fill: var(--dim); font-size: 10px; font-family: inherit; }

@@ -56,11 +56,23 @@ export function rounds(bets: BetRecord[]): Round[] {
   });
 }
 
-// Slot 1 and slot 2 of the categorical order, dark steps. Validated against this
-// dashboard's own surface (#0b0e14): lightness band, chroma floor, CVD separation
-// ΔE 26.8 protan, and 3:1 contrast all pass.
-const CUMULATIVE = "#3987e5";
-const PER_ROUND = "#d95926";
+/**
+ * Polarity, not identity: the line is green above zero and red below, so the sign is
+ * the colour's whole job. These are the dashboard's own win/loss steps, which is also
+ * what a won bet already wears in the timeline.
+ *
+ * The pair is a deliberate trade-off. Green and red at the *same* lightness are the
+ * same colour under deuteranopia — six band-compliant pairs were measured at ΔE 0.4
+ * to 4.9, well under the floor of 6. This pair separates at ΔE 10.6 deutan, above the
+ * target of 8, precisely because the two differ in lightness — which is what puts them
+ * outside the lightness band. Real separation beats band conformance here, and both
+ * clear 3:1 contrast on this surface.
+ *
+ * Colour is never the only cue regardless: sign is also position relative to the
+ * dashed zero line, and the end of each line carries a signed label.
+ */
+const POSITIVE = "#7fd962";
+const NEGATIVE = "#f07178";
 
 const W = 720;
 const H = 260;
@@ -82,13 +94,13 @@ export function renderChart(data: Round[]): string {
   return (
     panel(data, {
       get: (r) => r.pnl,
-      color: PER_ROUND,
+      id: "round",
       caption: `Result of each round on its own, in OOMs. ${data.length} rounds settled.`,
       markers: true,
     }) +
     panel(data, {
       get: (r) => r.cumulative,
-      color: CUMULATIVE,
+      id: "total",
       caption: "Running total of the same rounds, in OOMs.",
       markers: false,
     })
@@ -99,7 +111,8 @@ function panel(
   data: Round[],
   opts: {
     get: (r: Round) => number;
-    color: string;
+    /** Unique per panel: the clip paths are referenced by id. */
+    id: string;
     caption: string;
     markers: boolean;
   },
@@ -121,8 +134,17 @@ function panel(
   const path = data
     .map((r, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(opts.get(r)).toFixed(1)}`)
     .join(" ");
-  const last = data[data.length - 1]!;
-  const lastValue = opts.get(last);
+  // The same line closed back along the zero baseline, so the tint underneath can be
+  // clipped into an above-zero half and a below-zero half.
+  const area =
+    `${path} L${x(data.length - 1).toFixed(1)},${y(0).toFixed(1)} ` +
+    `L${x(0).toFixed(1)},${y(0).toFixed(1)} Z`;
+
+  const zeroY = y(0);
+  const aboveHeight = Math.max(0, zeroY - PAD.top);
+  const belowHeight = Math.max(0, PAD.top + plotH - zeroY);
+
+  const lastValue = opts.get(data[data.length - 1]!);
 
   return `
 <figure class="chart">
@@ -144,8 +166,24 @@ function panel(
       1,
     )}" class="zero"/>
 
-    <path d="${path}" fill="none" stroke="${opts.color}" stroke-width="2"
-          stroke-linejoin="round" stroke-linecap="round"/>
+    <!-- Two clipped copies of one line: the colour changes exactly at the zero
+         crossing, with no intersection points to compute. -->
+    <clipPath id="above-${opts.id}">
+      <rect x="${PAD.left}" y="${PAD.top}" width="${plotW}" height="${aboveHeight.toFixed(1)}"/>
+    </clipPath>
+    <clipPath id="below-${opts.id}">
+      <rect x="${PAD.left}" y="${zeroY.toFixed(1)}" width="${plotW}" height="${belowHeight.toFixed(
+        1,
+      )}"/>
+    </clipPath>
+
+    <path d="${area}" fill="${POSITIVE}" fill-opacity="0.13" clip-path="url(#above-${opts.id})"/>
+    <path d="${area}" fill="${NEGATIVE}" fill-opacity="0.13" clip-path="url(#below-${opts.id})"/>
+
+    <path d="${path}" fill="none" stroke="${POSITIVE}" stroke-width="2" stroke-linejoin="round"
+          stroke-linecap="round" clip-path="url(#above-${opts.id})"/>
+    <path d="${path}" fill="none" stroke="${NEGATIVE}" stroke-width="2" stroke-linejoin="round"
+          stroke-linecap="round" clip-path="url(#below-${opts.id})"/>
 
     ${data
       .map((r, i) => {
@@ -154,23 +192,25 @@ function panel(
         }, ${r.pnl >= 0 ? "+" : ""}${r.pnl} this round, ${
           r.cumulative >= 0 ? "+" : ""
         }${r.cumulative} cumulative`;
+        const value = opts.get(r);
 
         // Every point is hoverable on both panels; the hit target is wider than the
-        // mark. Where the mark is hidden the target is transparent, so the cumulative
+        // mark. Where the mark is hidden the target is transparent, so the total's
         // line stays clean without giving up the tooltip.
         return opts.markers
           ? // A 2px surface ring keeps a marker readable where the line doubles back.
-            `<circle cx="${x(i).toFixed(1)}" cy="${y(opts.get(r)).toFixed(1)}" r="4"
-               fill="${opts.color}" stroke="var(--bg)" stroke-width="2"><title>${esc(
-                 tip,
-               )}</title></circle>`
-          : `<circle cx="${x(i).toFixed(1)}" cy="${y(opts.get(r)).toFixed(1)}" r="7"
+            `<circle cx="${x(i).toFixed(1)}" cy="${y(value).toFixed(1)}" r="4"
+               fill="${value >= 0 ? POSITIVE : NEGATIVE}" stroke="var(--bg)"
+               stroke-width="2"><title>${esc(tip)}</title></circle>`
+          : `<circle cx="${x(i).toFixed(1)}" cy="${y(value).toFixed(1)}" r="7"
                fill="transparent"><title>${esc(tip)}</title></circle>`;
       })
       .join("")}
 
     <text x="${W - PAD.right + 8}" y="${(y(lastValue) + 3.5).toFixed(1)}" class="tick"
-          style="fill:${opts.color}">${lastValue >= 0 ? "+" : ""}${Math.round(lastValue)}</text>
+          style="fill:${lastValue >= 0 ? POSITIVE : NEGATIVE}">${
+            lastValue >= 0 ? "+" : ""
+          }${Math.round(lastValue)}</text>
 
     ${xLabels(data.length)
       .map(

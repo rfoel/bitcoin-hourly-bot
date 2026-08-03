@@ -151,11 +151,20 @@ two lines**: both are OOMs, but per-round swings ±200 while the total climbs pa
 one shared axis flattens the per-round line into noise — and a second y-scale would be a
 dual-axis chart, which invents a correlation that is not in the data.
 
-Series colours are slots 1 and 2 of a fixed categorical order, validated against this
-dashboard's own surface rather than eyeballed: lightness band, chroma floor, ΔE 26.8
-under protanopia, and 3:1 contrast all pass. One series per panel, so neither needs a
-legend — the caption names it. Every point carries a tooltip, with the hit target wider
-than the mark.
+Colour encodes polarity, not identity: each line is green above zero and red below,
+split by two clipped copies of the same path so it changes exactly at the crossing.
+
+That pair is a measured trade-off, not a default. Green and red at the *same* lightness
+are the same colour under deuteranopia — six lightness-band-compliant pairs came back at
+ΔE 0.4 to 4.9, under the floor of 6. The pair in use separates at **ΔE 10.6 deutan**,
+above the target of 8, precisely because the two differ in lightness, which is what puts
+them outside the band. Real separation beats band conformance here, and both clear 3:1
+contrast on this surface.
+
+Colour is never the only cue regardless: sign is also position against the dashed zero
+line, and each line ends in a signed label. One series per panel, so neither needs a
+legend — the caption names it. Every point carries a tooltip, hit target wider than the
+mark.
 
 ## Reading the numbers
 
