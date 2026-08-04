@@ -235,8 +235,23 @@ function statusOf(wager: Wager | undefined, bet: BetRecord): BetStatus {
     case "cancelled":
     case "disabled":
       return "cancelled";
+    case "sold": {
+      // Futuur reports `sold` for both a partial sell and a fully closed position, and
+      // only the second is over: with no shares left the wager can never resolve, so
+      // treating it as open leaves the bet pending forever and keeps its realised
+      // profit out of the stats entirely. That is not hypothetical — it is what the
+      // `sell` tool does every time it closes a position.
+      const shares = Number(wager.shares);
+      if (Number.isFinite(shares) && shares > 0) return "pending";
+
+      // The market's own answer is gone once the position is closed, so the only
+      // honest verdict left is whether the decision made money.
+      const profit = numeric(wager.last_profit);
+      if (profit === undefined) return "unknown";
+      return profit >= 0 ? "won" : "lost";
+    }
     default:
-      // `purchased` and `sold` are still open positions as far as we care.
+      // `purchased` is still an open position as far as we care.
       return "pending";
   }
 }
