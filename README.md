@@ -27,6 +27,7 @@ run reads as evidence.
 | `src/agent.ts` | The agent loop: system prompt, token budget, usage accounting |
 | `src/tools.ts` | The 10 tools Claude drives the market with |
 | `src/bet.ts` | Futuur mechanics — event discovery, sizing, order placement |
+| `src/polymarket.ts` | The same hour priced in real money on Polymarket, plus the line check |
 | `src/settle.ts` | Hourly reconciliation of placed bets against their wagers |
 | `src/store.ts` | DynamoDB access, cost model, stats |
 | `src/ui.ts` | Server-rendered dashboard |

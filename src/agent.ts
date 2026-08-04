@@ -3,6 +3,8 @@ import type { Currency, FuturEvent } from "futuur";
 
 import { fetchBtcSpot, listSides, parsePriceToBeat, placeBet, priceOf, resolveEvent, sdk, stakeFor, walletBalance } from "./bet.js";
 import { edges, fairValue, realisedVolatility } from "./edge.js";
+import { polymarketQuote } from "./polymarket.js";
+import type { PolymarketQuote } from "./polymarket.js";
 import { costOf, listNotes, listRuns, recordRun, summariseSpend } from "./store.js";
 import type { TokenUsage } from "./store.js";
 import { buildTools } from "./tools.js";
@@ -82,6 +84,32 @@ volatility read off the trailing hour, so it is most confident exactly when a re
 is starting: a 60-point disagreement with the book usually means the estimate is stale,
 not that the market is asleep. Treat a large edge as a reason to look harder at the
 book and the clock, and disagree with it when the tape says otherwise.
+
+## The Polymarket price
+
+The opening message also carries Polymarket's price for the same hour. Polymarket runs
+the identical market — up if BTC finishes the hour above where it opened — and resolves
+it on the Binance BTC/USDT hourly candle. Two things make it the strongest single input
+you have:
+
+- It is real money against a deeper book, while Futuur is play money and thin. A
+  play-money book can sit wrong for a whole hour because nobody is paid to correct it.
+- It is a price, not a model. It already contains the drift, the order flow and the
+  tape that the computed fair value assumes away.
+
+So treat it as the honest probability and the computed fair value as a cross-check. When
+the Futuur ask is well below Polymarket's price for the same side, that is the clearest
+edge this market offers, and it is the case worth sizing up on.
+
+Two limits on that. The first is thin volume, which the briefing gives you as a multiple
+of what an hour usually finishes having traded. Around 1x is a real consensus. Well under
+that is a couple of orders, and its price deserves roughly the weight of the computed
+fair value — but read it in context, because an hour that is already decided also stops
+trading, and low volume next to a price of 0.97 means the opposite of low volume next to
+a price of 0.50. And the line check matters more than the price — if the
+briefing says the two venues are settling against different numbers, they are not the
+same question and the comparison is worse than useless, because a difference in strikes
+reads exactly like an edge. In that case ignore Polymarket entirely for the hour.
 
 Before your first bet of the run, read get_history. Your settled results are the only
 evidence you have about whether your reasoning has been working, and the notes are what
@@ -279,7 +307,7 @@ export const handler = async () => {
  * value is an anchor, not an instruction — it is a driftless-walk estimate off trailing
  * volatility, so it is confident exactly where a real move is starting.
  */
-async function brief(event: FuturEvent, currency: Currency): Promise<string> {
+export async function brief(event: FuturEvent, currency: Currency): Promise<string> {
   const priceToBeat = parsePriceToBeat(event);
   const secondsLeft = Math.round((Date.parse(event.bet_end_date!) - Date.now()) / 1000);
   const currencyMode = currency === "OOM" ? "play_money" : "real_money";
@@ -289,9 +317,10 @@ async function brief(event: FuturEvent, currency: Currency): Promise<string> {
     side,
   }));
 
-  const [spot, vol, ...books] = await Promise.all([
+  const [spot, vol, polymarket, ...books] = await Promise.all([
     fetchBtcSpot(),
     realisedVolatility(),
+    polymarketQuote(Date.parse(event.bet_end_date!), priceToBeat),
     ...sides.map((s) =>
       sdk
         .getOrderBook(s.side.market.id, { currency_mode: currencyMode, position: s.side.position })
@@ -328,7 +357,80 @@ async function brief(event: FuturEvent, currency: Currency): Promise<string> {
     `Computed fair value — driftless walk, sigma ${value.sigmaAnnual} annualised from ${value.samples} 1m candles, ${value.sigmasAway} sigma from the line:`,
     ...lines,
     `That estimate is backward-looking: it reads a starting move as impossible, so treat a huge edge as a reason to look closer rather than a reason to size up.`,
+    ...describePolymarket(polymarket, asks),
   ].join("\n");
+}
+
+/**
+ * Polymarket's real-money price for the same hour, and what it says about the Futuur
+ * asks. The line check comes last and states its own conclusion, because a quote on a
+ * different strike is the one way this section can actively mislead.
+ */
+function describePolymarket(
+  quote: PolymarketQuote | null,
+  asks: { up: number | null; down: number | null },
+): string[] {
+  if (quote === null) {
+    return ["Polymarket's hourly market could not be read this run — no second opinion."];
+  }
+
+  const sides = quote.sides.map(
+    (side) =>
+      `  ${side.direction.padEnd(4)} bid ${fmt(side.bid)} · ask ${fmt(side.ask)} · mid ${fmt(side.mid)}`,
+  );
+
+  const lines = [
+    `Polymarket on the same hour — real money, $${Math.round(quote.volume).toLocaleString(
+      "en-US",
+    )} traded, $${Math.round(quote.liquidity).toLocaleString("en-US")} quoted. That is ` +
+      `${quote.volumeVersusTypical.toFixed(2)}x what an hour usually finishes at:`,
+    ...sides,
+  ];
+
+  if (quote.up !== null) {
+    // Priced against the Futuur ask rather than its display price: the ask is what a
+    // taker actually pays, so this is the edge as it would really be captured.
+    const versus = (["up", "down"] as const)
+      .map((direction) => {
+        const ask = asks[direction];
+        const fair = direction === "up" ? quote.up! : 1 - quote.up!;
+        if (ask === null) return `${direction} —`;
+        const edge = fair - ask;
+        return `${direction} ${edge >= 0 ? "+" : ""}${edge.toFixed(2)}`;
+      })
+      .join(", ");
+    lines.push(
+      `  Polymarket puts up at ${quote.up.toFixed(2)}. Against the Futuur asks: ${versus}.`,
+    );
+  }
+
+  const strike = quote.strike;
+  if (strike === null) {
+    lines.push(
+      `  Line check unavailable — the Binance hourly open could not be read, so nothing ` +
+        `confirms the two venues are settling against the same number. Discount accordingly.`,
+    );
+  } else if (strike.aligned) {
+    lines.push(
+      `  Line check: Binance hourly open ${strike.binanceOpen} against Futuur's price to ` +
+        `beat ${strike.futuurPriceToBeat} — the same line, ${Math.abs(strike.difference).toFixed(
+          2,
+        )} apart. The two markets are the same question.`,
+    );
+  } else {
+    lines.push(
+      `  Line check FAILED: Binance hourly open ${strike.binanceOpen} against Futuur's ` +
+        `price to beat ${strike.futuurPriceToBeat} — ${Math.abs(strike.difference).toFixed(2)} ` +
+        `apart. These are different questions and the prices are not comparable. Ignore ` +
+        `the Polymarket numbers above for this hour.`,
+    );
+  }
+
+  return lines;
+}
+
+function fmt(value: number | null): string {
+  return value === null ? "—" : value.toFixed(2);
 }
 
 /**
