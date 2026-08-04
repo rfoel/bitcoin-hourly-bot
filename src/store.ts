@@ -366,8 +366,11 @@ export function summarise(bets: BetRecord[]): Stats {
     if (bet.status !== "won" && bet.status !== "lost") continue;
 
     const won = bet.status === "won";
-    // A loss forfeits the stake; a win reports its own earnings.
-    const earnings = won ? (bet.earnings ?? 0) : -bet.estimatedCost;
+    // Whatever settling worked out is the truth when it is there. Forfeiting the whole
+    // stake is only right for a bet held to resolution — a position sold before the
+    // close recovers part of it, and substituting the full cost there overstated one
+    // loss by 235 on a 380 bet.
+    const earnings = bet.earnings ?? (won ? 0 : -bet.estimatedCost);
     stats.settledStaked = round2(stats.settledStaked + bet.estimatedCost);
 
     stats[won ? "won" : "lost"] += 1;
