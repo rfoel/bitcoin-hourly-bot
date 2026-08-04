@@ -5,19 +5,22 @@ hourly market with play money, and a dashboard shows what it did and what decidi
 
 Live at **[bitcoin.rfoel.dev](https://bitcoin.rfoel.dev)**.
 
-Every hour at `:45` a Lambda wakes Claude with tools for the market, the order book, the
-spot price, its own settled results and its notes. It has the last 15 minutes of the hour
-to work: read, wait, bet, add, sell, or pass. At `:06` a second Lambda reconciles the
-previous hour's bets against Futuur and writes the results back, which is what the next
-run reads as evidence.
+Every hour at `:53` a Lambda wakes Claude with tools for the market, both order books,
+the spot price, Polymarket's real-money price for the same hour, its own settled results
+and its notes. It has the rest of the hour to work: read, wait, bet, add, sell, or pass.
+At `:06` a second Lambda reconciles the previous hour's bets against Futuur and writes
+the results back, which is what the next run reads as evidence. At `:20` a third rewrites
+the notes into a shorter set once they outgrow what the briefing can carry.
 
 ## Architecture
 
 ```
-:45  HourlyBitcoinBet ──▶ Claude agent loop (15 min) ──┐
+:53  HourlyBitcoinBet ──▶ Claude agent loop ───────────┐
                           10 tools, bets/sells/passes  │
                                                        ├──▶ DynamoDB "Memory"
 :06  SettleBets ──────▶ reconcile wagers → win/loss ───┤     BET / RUN / NOTE
+                                                       │
+:20  CompactNotes ────▶ rewrite notes, archive old ────┤
                                                        │
      bitcoin.rfoel.dev ──▶ dashboard + JSON ───────────┘
 ```
@@ -29,6 +32,7 @@ run reads as evidence.
 | `src/bet.ts` | Futuur mechanics — event discovery, sizing, order placement |
 | `src/polymarket.ts` | The same hour priced in real money on Polymarket, plus the line check |
 | `src/settle.ts` | Hourly reconciliation of placed bets against their wagers |
+| `src/compact.ts` | Rewrites the notes into a shorter set, with a validation gate |
 | `src/store.ts` | DynamoDB access, cost model, stats |
 | `src/ui.ts` | Server-rendered dashboard |
 | `src/api.ts` | HTTP routing for the dashboard and the JSON endpoints |

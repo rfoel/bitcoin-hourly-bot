@@ -133,6 +133,33 @@ export default $config({
       },
     });
 
+    // The agent may write a note every hour and reads all of them before every
+    // decision, so the notebook grows while the value of reading it does not. This
+    // rewrites it into a shorter set once it passes the threshold, and no-ops below —
+    // hourly rather than daily because at one note per run a daily pass would let it
+    // overshoot the injection limit by half a day.
+    //
+    // :20 keeps it clear of both the settle at :06 and the agent from :53.
+    const compact = new sst.aws.CronV2("CompactNotes", {
+      schedule: "cron(20 * * * ? *)",
+      timezone: "UTC",
+      retries: 2,
+      dlq: dlq.arn,
+      function: {
+        handler: "src/compact.handler",
+        environment: {
+          ANTHROPIC_API_KEY: anthropicKey.value,
+          // Five below the 20 the briefing injects, so compaction happens before any
+          // note is silently dropped rather than after.
+          COMPACT_THRESHOLD: "15",
+          COMPACT_MODEL: "claude-sonnet-5",
+        },
+        link: [memory],
+        ...runtime,
+        timeout: "2 minutes",
+      },
+    });
+
     const api = new sst.aws.ApiGatewayV2("BetApi", {
       domain: { name: domain.value, dns: sst.aws.dns() },
       cors: false,
@@ -153,6 +180,7 @@ export default $config({
       api: api.url,
       agent: cron.nodes.function.name,
       settler: settle.nodes.function.name,
+      compactor: compact.nodes.function.name,
       table: memory.name,
       dlq: dlq.url,
     };

@@ -1,5 +1,6 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
+  BatchWriteCommand,
   DynamoDBDocumentClient,
   PutCommand,
   QueryCommand,
@@ -19,6 +20,8 @@ import { Resource } from "sst";
 const BET = "BET";
 const NOTE = "NOTE";
 const RUN = "RUN";
+/** Notes as they stood before a compaction replaced them. Never read by the agent. */
+const NOTE_ARCHIVE = "NOTE_ARCHIVE";
 
 /**
  * Claude API list price per million tokens. Cache reads bill at 0.1x input and
@@ -234,6 +237,78 @@ export async function putNote(text: string, tags: string[] = []): Promise<NoteRe
 
   await client.send(new PutCommand({ TableName: table(), Item: record }));
   return record;
+}
+
+/**
+ * Swap the whole note set for a shorter one, keeping the originals in an archive
+ * partition the agent never reads.
+ *
+ * `fresh` is written least-durable first, because the agent reads notes newest-first
+ * under a limit: giving the notes that age worst the older timestamps makes them the
+ * first to fall out if the set grows past what the prompt injects.
+ *
+ * The archive is written before anything is deleted, so a failure part-way through
+ * costs a duplicate archive row rather than the notes themselves.
+ */
+export async function replaceNotes(
+  fresh: { text: string; tags?: string[] }[],
+): Promise<NoteRecord[]> {
+  const previous = await listNotes(200);
+  const at = new Date().toISOString();
+
+  await client.send(
+    new PutCommand({
+      TableName: table(),
+      Item: {
+        pk: NOTE_ARCHIVE,
+        sk: at,
+        archivedAt: at,
+        count: previous.length,
+        notes: previous.map((note) => ({
+          createdAt: note.createdAt,
+          text: note.text,
+          tags: note.tags,
+        })),
+      },
+    }),
+  );
+
+  const written: NoteRecord[] = fresh.map((note, i) => {
+    // One second apart so the intended order survives a lexicographic sort, and
+    // stamped in the past so a note written by a run mid-compaction still sorts newest.
+    const createdAt = new Date(Date.parse(at) - (fresh.length - i) * 1000).toISOString();
+    return {
+      pk: NOTE,
+      sk: `${createdAt}#${Math.random().toString(36).slice(2, 8)}`,
+      createdAt,
+      text: note.text,
+      tags: note.tags ?? [],
+    };
+  });
+
+  await batchWrite([
+    ...previous.map((note) => ({ DeleteRequest: { Key: { pk: note.pk, sk: note.sk } } })),
+    ...written.map((note) => ({ PutRequest: { Item: note } })),
+  ]);
+
+  return written;
+}
+
+/** BatchWriteItem caps at 25 operations, and returns anything it declined to do. */
+async function batchWrite(requests: Record<string, unknown>[]): Promise<void> {
+  for (let i = 0; i < requests.length; i += 25) {
+    let batch = requests.slice(i, i + 25);
+
+    for (let attempt = 0; batch.length > 0 && attempt < 5; attempt++) {
+      const result = await client.send(
+        new BatchWriteCommand({ RequestItems: { [table()]: batch } }),
+      );
+      batch = (result.UnprocessedItems?.[table()] ?? []) as typeof batch;
+      if (batch.length > 0) await new Promise((r) => setTimeout(r, 100 * 2 ** attempt));
+    }
+
+    if (batch.length > 0) throw new Error(`${batch.length} writes never went through`);
+  }
 }
 
 /** Newest notes first. */
