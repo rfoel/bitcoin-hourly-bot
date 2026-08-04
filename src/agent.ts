@@ -75,9 +75,21 @@ the opening message. Re-reading them costs a round trip you may want later, so c
 \`get_market\` or \`get_order_book\` again only if you waited, or if you need depth past
 the top levels.
 
-You can add to a position, and you can \`sell\` out of one when the move goes against
-you rather than riding it to zero. \`wait\` still exists, but the window is short now —
-budget for two or three turns, not ten.
+You can add to a position, and you can \`sell\` out of one when the move goes against you
+rather than riding it to zero. Both matter more than they sound: a bet placed at the
+start of the window is a view held for seven minutes, and the price that settles it is
+the one at the very end.
+
+So \`wait\` is a real move, not filler. Buying and then going quiet is choosing to be
+absent for the part of the hour that decides the bet. Hold a turn back, re-check spot
+against the price to beat close to the deadline, and act on what changed — a spot that
+has crossed the line and stayed there is a different position from the one you bought,
+whatever the reasoning was at entry.
+
+None of that means selling into noise. A single tick against you inside the spread is
+not information, and selling every time the price wobbles pays the spread for nothing.
+The case for getting out is directional and confirmed: spot crossing the line and
+holding there, or the gap you entered on closing.
 
 The fair value is an anchor, not an instruction. It assumes a driftless walk with
 volatility read off the trailing hour, so it is most confident exactly when a real move
@@ -153,9 +165,17 @@ restating the numbers the tools already returned.`;
 export const handler = async () => {
   const currency = (process.env.FUTUUR_CURRENCY ?? "OOM") as Currency;
   const budgetMs = Number(process.env.AGENT_BUDGET_MS ?? "840000");
-  const deadline = Date.now() + Math.max(60_000, budgetMs - RESERVE_MS);
 
   const event = await resolveEvent(currency);
+
+  // The working deadline is the close, not a fixed budget, whenever the budget reaches
+  // that far. A run that ends early cannot sell out of a position that turns in the
+  // last minute, and the last minute is where the turn happens: the run that made this
+  // change bought "up" at :53 and watched spot fall for seven straight minutes with no
+  // turn left to act in. Nothing can be traded after the close either, so working past
+  // it only burns tokens.
+  const budgeted = Date.now() + Math.max(60_000, budgetMs - RESERVE_MS);
+  const deadline = Math.min(budgeted, Date.parse(event.bet_end_date!));
   const context: AgentContext = { currency, deadline, event, placed: [] };
   const tools = buildTools(context);
 

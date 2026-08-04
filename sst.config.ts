@@ -79,6 +79,12 @@ export default $config({
     // :53 rather than :45. Measured runs take 223-628s (median 335s) and never call
     // `wait`, so the wide window was idle time — and the bets that actually carry the
     // P&L land latest, where the book has had time to misprice a drifting spot.
+    //
+    // The window stayed at :53, but the budget now reaches the close rather than
+    // stopping 90s short of it. Shrinking the window had also removed the agent's
+    // ability to manage what it bought, which is a different thing from removing idle
+    // time: it never called `wait` partly because it was told there was no point.
+    //
     // `retries: 0` on purpose: a retry would re-enter a window the first attempt may
     // already have bet in.
     const cron = new sst.aws.CronV2("HourlyBitcoinBet", {
@@ -91,9 +97,12 @@ export default $config({
         environment: {
           ...betting,
           ANTHROPIC_API_KEY: anthropicKey.value,
-          // Working budget inside the invocation; the handler holds back 45s of the
-          // Lambda timeout so it can always finish cleanly.
-          AGENT_BUDGET_MS: "375000",
+          // Enough to reach the close from :53 (420s) plus the 45s the handler holds
+          // back to finish cleanly. At 375000 the working budget ran out 90 seconds
+          // early, so `managed` was false on every single run and the agent was told
+          // outright that it would get no turn to sell — which is how two positions
+          // ended up needing a human to exit them.
+          AGENT_BUDGET_MS: "465000",
           // Narrower than the shared 70: the cron fires at :45, so the only event it
           // should ever pick is the one closing at the top of this hour. A 70-minute
           // window lets it land on a market an hour out that it cannot see through.
@@ -112,7 +121,8 @@ export default $config({
         },
         link: [memory],
         ...runtime,
-        timeout: "7 minutes",
+        // Covers the working budget with room for the final turn on top.
+        timeout: "9 minutes",
         memory: "512 MB",
       },
     });
