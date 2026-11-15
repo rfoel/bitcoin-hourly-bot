@@ -3,7 +3,9 @@ import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda
 import { placeBet, walletBalance } from "./bet.js";
 import type { BetOverrides } from "./bet.js";
 import { listBets, listNotes, listRuns, putNote, summarise, summariseSpend } from "./store.js";
+import { getLedger, listRounds } from "./rounds.js";
 import { renderPage } from "./ui.js";
+import { renderRounds } from "./ui5.js";
 import type { DashboardState } from "./ui.js";
 
 export const handler = async (
@@ -24,7 +26,19 @@ export const handler = async (
       case "GET /health":
         return json(200, { ok: true });
 
-      case "GET /":
+      case "GET /": {
+        const [ledger, rounds] = await Promise.all([getLedger(), listRounds(limitOf(event, 288))]);
+        return html(200, renderRounds(ledger, rounds));
+      }
+
+      // Every 5-minute round, bet or skipped, with what the bot saw and why it decided.
+      case "GET /rounds": {
+        const [ledger, rounds] = await Promise.all([getLedger(), listRounds(limitOf(event, 288))]);
+        return json(200, { ledger, rounds });
+      }
+
+      // The hourly agent's history, from before the bot moved to the 5-minute market.
+      case "GET /hourly":
         return html(200, renderPage(await loadDashboard()));
 
       case "GET /state":

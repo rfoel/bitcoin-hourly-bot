@@ -17,7 +17,6 @@ export default $config({
     const privateKey = new sst.Secret("FutuurPrivateKey");
     // Shared secret for the on-demand endpoint. Without it the API rejects everything.
     const apiToken = new sst.Secret("ApiToken");
-    const anthropicKey = new sst.Secret("AnthropicApiKey");
 
     // Not a secret, but SST's per-stage config value. No default on purpose: every
     // stage states its own hostname, so a deploy can never inherit another stage's
@@ -71,101 +70,48 @@ export default $config({
     // Failed cron invocations land here after the scheduler exhausts its retries.
     const dlq = new sst.aws.Queue("BetDlq");
 
-    // Claude works the last 15 minutes of the hour as an agent: reads the market,
-    // its own settled history and its notes, then bets, adds, sells or passes. One
-    // invocation spans the whole window, so `wait` is a real move — it can watch the
-    // gap develop and act closer to resolution, where the signal is strongest.
+    // The Futuur "Bitcoin Up or Down — 5 min" market (category 3728), bet in its last
+    // seconds. Fires at minute 4 of every 5-minute window — one minute before the
+    // close — settles the rounds that resolved since, then sleeps until
+    // FIVEMIN_DECIDE_AT seconds before the close and decides. See src/fivemin.ts.
     //
-    // :53 rather than :45. Measured runs take 223-628s (median 335s) and never call
-    // `wait`, so the wide window was idle time — and the bets that actually carry the
-    // P&L land latest, where the book has had time to misprice a drifting spot.
-    //
-    // The window stayed at :53, but the budget now reaches the close rather than
-    // stopping 90s short of it. Shrinking the window had also removed the agent's
-    // ability to manage what it bought, which is a different thing from removing idle
-    // time: it never called `wait` partly because it was told there was no point.
+    // This replaced the hourly Claude agent. An LLM turn takes longer than the window
+    // it would have to act in, and 288 runs a day would cost ~$40 in tokens.
     //
     // `retries: 0` on purpose: a retry would re-enter a window the first attempt may
     // already have bet in.
-    const cron = new sst.aws.CronV2("HourlyBitcoinBet", {
-      schedule: "cron(53 * * * ? *)",
+    const fiveMin = new sst.aws.CronV2("FiveMinuteBitcoinBet", {
+      schedule: "cron(4/5 * * * ? *)",
       timezone: "UTC",
       retries: 0,
       dlq: dlq.arn,
       function: {
-        handler: "src/agent.handler",
+        handler: "src/fivemin.handler",
         environment: {
           ...betting,
-          ANTHROPIC_API_KEY: anthropicKey.value,
-          // Enough to reach the close from :53 (420s) plus the 45s the handler holds
-          // back to finish cleanly. At 375000 the working budget ran out 90 seconds
-          // early, so `managed` was false on every single run and the agent was told
-          // outright that it would get no turn to sell — which is how two positions
-          // ended up needing a human to exit them.
-          AGENT_BUDGET_MS: "465000",
-          // Narrower than the shared 70: the cron fires at :45, so the only event it
-          // should ever pick is the one closing at the top of this hour. A 70-minute
-          // window lets it land on a market an hour out that it cannot see through.
-          FUTUUR_WINDOW_MINUTES: "15",
-          // Sonnet 5 reaches near-Opus quality on agentic work at roughly 40% of the
-          // cost. The model is recorded on every run, so switching back is a config
-          // change and the two are comparable on win rate afterwards.
-          AGENT_MODEL: "claude-sonnet-5",
-          AGENT_EFFORT: "high",
-          AGENT_TOKEN_BUDGET: "250000",
-          AGENT_MAX_ITERATIONS: "40",
-          // Off. The spot rule it falls back to has run -19% ROI over 38 bets, so a
-          // failed agent betting anyway costs more than a skipped hour, which costs
-          // nothing.
-          AGENT_FALLBACK: "false",
+          FIVEMIN_CATEGORY_ID: "3728",
+          // Starting bankroll. Read only when the ledger (pk FIVEMIN, sk STATE) is
+          // created on the first run; after that the ledger is the truth.
+          FIVEMIN_BUDGET: "10000",
+          // Decide 15s before the close; never place an order with under 4s left.
+          FIVEMIN_DECIDE_AT: "15",
+          FIVEMIN_LATEST_AT: "4",
+          // Only buy ask levels at least 5 points below the model's probability, and
+          // only when the favoured side is at least 70% likely.
+          FIVEMIN_MIN_EDGE: "0.05",
+          FIVEMIN_MIN_PROB: "0.7",
+          // All-in allowed: one round may stake the whole bankroll. Kelly decides how
+          // much of it — ~all of it near certainty, about half at 80%.
+          FIVEMIN_MAX_FRACTION: "1",
+          FIVEMIN_KELLY: "1",
+          // BTC's 15-second tails are fatter than a random walk's.
+          FIVEMIN_VOL_MULT: "1.5",
+          FIVEMIN_MIN_STAKE: "10",
+          FIVEMIN_DRY_RUN: "false",
         },
         link: [memory],
         ...runtime,
-        // Covers the working budget with room for the final turn on top.
-        timeout: "9 minutes",
-        memory: "512 MB",
-      },
-    });
-
-    const settle = new sst.aws.CronV2("SettleBets", {
-      // :06 every hour — the hourly market has closed and resolved by then.
-      schedule: "cron(6 * * * ? *)",
-      timezone: "UTC",
-      retries: 2,
-      dlq: dlq.arn,
-      function: {
-        handler: "src/settle.handler",
-        environment: betting,
-        link: [memory],
-        // Reconciling several events takes more than one round trip.
-        ...runtime,
-        timeout: "2 minutes",
-      },
-    });
-
-    // The agent may write a note every hour and reads all of them before every
-    // decision, so the notebook grows while the value of reading it does not. This
-    // rewrites it into a shorter set once it passes the threshold, and no-ops below —
-    // hourly rather than daily because at one note per run a daily pass would let it
-    // overshoot the injection limit by half a day.
-    //
-    // :20 keeps it clear of both the settle at :06 and the agent from :53.
-    const compact = new sst.aws.CronV2("CompactNotes", {
-      schedule: "cron(20 * * * ? *)",
-      timezone: "UTC",
-      retries: 2,
-      dlq: dlq.arn,
-      function: {
-        handler: "src/compact.handler",
-        environment: {
-          ANTHROPIC_API_KEY: anthropicKey.value,
-          // Five below the 20 the briefing injects, so compaction happens before any
-          // note is silently dropped rather than after.
-          COMPACT_THRESHOLD: "15",
-          COMPACT_MODEL: "claude-sonnet-5",
-        },
-        link: [memory],
-        ...runtime,
+        // From :X4:00 to the close plus settling and recording.
         timeout: "2 minutes",
       },
     });
@@ -188,9 +134,7 @@ export default $config({
 
     return {
       api: api.url,
-      agent: cron.nodes.function.name,
-      settler: settle.nodes.function.name,
-      compactor: compact.nodes.function.name,
+      bot: fiveMin.nodes.function.name,
       table: memory.name,
       dlq: dlq.url,
     };

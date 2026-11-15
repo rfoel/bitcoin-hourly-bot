@@ -152,7 +152,7 @@ function numeric(value: unknown): number | undefined {
  * — they agree exactly (740 - 402.52 = 337.48 on wager 912901), and both are net of
  * fees, unlike deriving from our own recorded cost.
  */
-function profitOf(wager: Wager): number | undefined {
+export function profitOf(wager: Wager): number | undefined {
   const reported = numeric(wager.last_profit);
   if (reported !== undefined) return reported;
 
@@ -180,7 +180,7 @@ function roiOf(wager: Wager): number | undefined {
  * paginated envelope — trusting the declared type threw `not iterable` and left every
  * bet unsettled. Accept either shape.
  */
-function toWagers(value: unknown): Wager[] {
+export function toWagers(value: unknown): Wager[] {
   if (Array.isArray(value)) return value as Wager[];
 
   const results = (value as { results?: unknown } | null)?.results;
@@ -204,7 +204,7 @@ function matchWager(wagers: Wager[], bet: BetRecord): Wager | undefined {
  * object. Both shapes appear, so read the id out of either — the URL-only version
  * silently produced `undefined` and no bet ever matched its wager.
  */
-function marketIdOf(market: Wager["market"]): number | undefined {
+export function marketIdOf(market: Wager["market"]): number | undefined {
   if (typeof market === "number") return market;
 
   if (typeof market === "string") {

@@ -1,16 +1,89 @@
 # bitcoin-hourly
 
-Claude trades the Futuur [Bitcoin Up or Down](https://futuur.com/markets/bitcoin-hourly)
-hourly market with play money, and a dashboard shows what it did and what deciding cost.
+Bets the Futuur [Bitcoin Up or Down — 5 min](https://futuur.com/q/254977/bitcoin-up-or-down-price-to-beat-6516700-5-min)
+market with play money, in the last seconds of each window, and records every round so
+the run can be audited afterwards.
 
 Live at **[bitcoin.rfoel.dev](https://bitcoin.rfoel.dev)**.
 
-Every hour at `:53` a Lambda wakes Claude with tools for the market, both order books,
+This repo started as a Claude agent trading the hourly market. That agent's code and
+history are still here (the old dashboard is at `/hourly`), but nothing schedules it any
+more — see [The hourly agent](#the-hourly-agent) below.
+
+## The 5-minute bot
+
+`src/fivemin.ts`, on `cron(4/5 * * * ? *)` — minute 4 of every 5-minute window, one
+minute before the close. Each run:
+
+1. **Settles** every pending round that has resolved, with Futuur's own P&L off the wager,
+   and credits it back to the ledger.
+2. **Finds** the open event in category **3728** (`bitcoin-5min`) closing within the window.
+3. **Sleeps** until `FIVEMIN_DECIDE_AT` (15) seconds before the close.
+4. **Reads** the Binance BTC/USDT 5m candle in progress — the exact candle Futuur settles
+   on. Its open must equal the event's price to beat (the line check), and its latest
+   close is where the market would settle right now.
+5. **Decides**: the side spot is on, with a probability from a driftless walk over the
+   seconds left (`src/edge.ts`, volatility from the last hour × `FIVEMIN_VOL_MULT`).
+   Below `FIVEMIN_MIN_PROB` it skips.
+6. **Sizes** by walking the ask ladder (`src/plan.ts`): only levels at least
+   `FIVEMIN_MIN_EDGE` below the probability, capped by Kelly on the running average
+   price. That is roughly all-in near certainty and about half the bankroll at 80%.
+7. **Bets** with one limit order at the deepest level touched, and **records** the round.
+
+### Why the end of the window
+
+Watched live, Futuur's book on this market is a static ladder centred on 0.50 —
+`0.51 × 577`, `0.52 × 1155`, … up to `0.99` — that does not reprice as BTC moves. With
+10 seconds left and spot $62 above the line it was still selling "Up" at 0.51. There are
+no fees (`get_tax` is null). Events open about a minute into their window and resolve
+about a minute after the close.
+
+### Budget
+
+The bot keeps its own ledger (`pk FIVEMIN`, `sk STATE`), seeded once from
+`FIVEMIN_BUDGET` = **10,000 OOM**. A bet's cost is held out of the bankroll until it
+settles, then the cost plus Futuur's P&L comes back. A round never stakes more than
+`min(ledger bankroll, wallet balance) × FIVEMIN_MAX_FRACTION` — `1`, so all-in is allowed.
+
+To start over with a fresh budget, delete that one item; the next run re-seeds it.
+
+### Checking progress
+
+Every round is written to `pk ROUND5`, `sk <close time>` — bets and skips alike, with
+the line, spot, gap, seconds left, probability, plan, order id, fill, P&L and bankroll
+after.
+
+| Where | What |
+| --- | --- |
+| `GET /` | Ledger and every round, refreshing every 30s |
+| `GET /rounds?limit=N` | The same as JSON (default 288 = one day) |
+| CloudWatch, `FiveMinuteBitcoinBet` | `bet placed` / `skipped` / `settled` log lines per run |
+
+### Configuration
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `FIVEMIN_BUDGET` | `10000` | Starting bankroll, only read when the ledger is created |
+| `FIVEMIN_DECIDE_AT` | `15` | Seconds before the close to decide |
+| `FIVEMIN_LATEST_AT` | `4` | Skip if fewer seconds than this are left |
+| `FIVEMIN_MIN_PROB` | `0.7` | Skip below this probability for the favoured side |
+| `FIVEMIN_MIN_EDGE` | `0.05` | Only buy levels at least this far below the probability |
+| `FIVEMIN_MAX_FRACTION` | `1` | Share of the bankroll one round may stake |
+| `FIVEMIN_KELLY` | `1` | Kelly multiplier; `0.5` is half-Kelly |
+| `FIVEMIN_VOL_MULT` | `1.5` | Safety factor on realised volatility |
+| `FIVEMIN_DRY_RUN` | `false` | Record what it would bet without placing an order |
+
+## The hourly agent
+
+Everything from here down describes the earlier hourly agent. Its crons
+(`HourlyBitcoinBet`, `SettleBets`, `CompactNotes`) were removed from `sst.config.ts`
+when the bot moved to the 5-minute market; the code is kept for its history.
+
+Every hour at `:53` a Lambda woke Claude with tools for the market, both order books,
 the spot price, Polymarket's real-money price for the same hour, its own settled results
-and its notes. It has the rest of the hour to work: read, wait, bet, add, sell, or pass.
-At `:06` a second Lambda reconciles the previous hour's bets against Futuur and writes
-the results back, which is what the next run reads as evidence. At `:20` a third rewrites
-the notes into a shorter set once they outgrow what the briefing can carry.
+and its notes. It had the rest of the hour to work: read, wait, bet, add, sell, or pass.
+At `:06` a second Lambda reconciled the previous hour's bets against Futuur and wrote
+the results back. At `:20` a third rewrote the notes into a shorter set.
 
 ## Architecture
 
@@ -45,7 +118,6 @@ Lambda `nodejs24.x` on arm64, region `sa-east-1`.
 pnpm install
 pnpm sst secret set FutuurPublicKey  <your-public-key>  --stage production
 pnpm sst secret set FutuurPrivateKey <your-private-key> --stage production
-pnpm sst secret set AnthropicApiKey  <sk-ant-...>       --stage production
 pnpm sst secret set ApiToken "$(openssl rand -hex 32)"  --stage production
 pnpm sst secret set Domain           <dashboard-hostname>  --stage production
 pnpm sst deploy --stage production
