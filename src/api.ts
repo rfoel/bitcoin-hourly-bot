@@ -28,7 +28,8 @@ export const handler = async (
 
       case "GET /": {
         const [ledger, rounds] = await Promise.all([getLedger(), listRounds(limitOf(event, 288))]);
-        return html(200, renderRounds(ledger, rounds));
+        const onlyBets = event.queryStringParameters?.ver === "apostas";
+        return html(200, renderRounds(ledger, rounds, { onlyBets }));
       }
 
       // Every 5-minute round, bet or skipped, with what the bot saw and why it decided.
