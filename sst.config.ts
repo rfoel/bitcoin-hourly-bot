@@ -70,10 +70,18 @@ export default $config({
     // Failed cron invocations land here after the scheduler exhausts its retries.
     const dlq = new sst.aws.Queue("BetDlq");
 
-    // The Futuur "Bitcoin Up or Down — 5 min" market (category 3728), bet in its last
-    // seconds. Fires at minute 4 of every 5-minute window — one minute before the
-    // close — settles the rounds that resolved since, then sleeps until
-    // FIVEMIN_DECIDE_AT seconds before the close and decides. See src/fivemin.ts.
+    // The assets the 5-minute bot plays, each with its own bankroll: keys from
+    // src/assets.ts. Shared with the API so the dashboard offers a page for each.
+    const fiveMinAssets = "btc,eth,sol";
+
+    // Futuur's "Up or Down — 5 min" markets, bet in their last seconds. Fires at
+    // minute 4 of every 5-minute window — one minute before the close — settles the
+    // rounds that resolved since, then sleeps until FIVEMIN_DECIDE_AT seconds before
+    // the close and decides. See src/fivemin.ts.
+    //
+    // One function plays every asset, side by side: their windows close at the same
+    // instant, so a Lambda per asset would triple the invocations for the same wait.
+    // The resource keeps its Bitcoin-only name so the schedule is not recreated.
     //
     // This replaced the hourly Claude agent. An LLM turn takes longer than the window
     // it would have to act in, and 288 runs a day would cost ~$40 in tokens.
@@ -89,9 +97,10 @@ export default $config({
         handler: "src/fivemin.handler",
         environment: {
           ...betting,
-          FIVEMIN_CATEGORY_ID: "3728",
-          // Starting bankroll. Read only when the ledger (pk FIVEMIN, sk STATE) is
-          // created on the first run; after that the ledger is the truth.
+          FIVEMIN_ASSETS: fiveMinAssets,
+          // Starting bankroll of each asset. Read only when that asset's ledger
+          // (pk FIVEMIN, sk STATE / STATE#ETH / STATE#SOL) is created on its first
+          // run; after that the ledger is the truth.
           FIVEMIN_BUDGET: "10000",
           // Decide 15s before the close; never place an order with under 4s left.
           FIVEMIN_DECIDE_AT: "15",
@@ -104,7 +113,7 @@ export default $config({
           // much of it — ~all of it near certainty, about half at 80%.
           FIVEMIN_MAX_FRACTION: "1",
           FIVEMIN_KELLY: "1",
-          // BTC's 15-second tails are fatter than a random walk's.
+          // Crypto's 15-second tails are fatter than a random walk's.
           FIVEMIN_VOL_MULT: "1.5",
           FIVEMIN_MIN_STAKE: "10",
           FIVEMIN_DRY_RUN: "false",
@@ -123,7 +132,7 @@ export default $config({
 
     const onDemand = {
       handler: "src/api.handler",
-      environment: { ...betting, API_TOKEN: apiToken.value },
+      environment: { ...betting, API_TOKEN: apiToken.value, FIVEMIN_ASSETS: fiveMinAssets },
       link: [memory],
       ...runtime,
     };

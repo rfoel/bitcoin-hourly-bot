@@ -1,8 +1,8 @@
 # bitcoin-hourly
 
 Bets the Futuur [Bitcoin Up or Down — 5 min](https://futuur.com/q/254977/bitcoin-up-or-down-price-to-beat-6516700-5-min)
-market with play money, in the last seconds of each window, and records every round so
-the run can be audited afterwards.
+market — and its Ethereum and Solana twins — with play money, in the last seconds of
+each window, and records every round so the run can be audited afterwards.
 
 Live at **[bitcoin.rfoel.dev](https://bitcoin.rfoel.dev)**.
 
@@ -17,11 +17,11 @@ minute before the close. Each run:
 
 1. **Settles** every pending round that has resolved, with Futuur's own P&L off the wager,
    and credits it back to the ledger.
-2. **Finds** the open event in category **3728** (`bitcoin-5min`) closing within the window.
+2. **Finds** the open event in the asset's category closing within the window.
 3. **Sleeps** until `FIVEMIN_DECIDE_AT` (15) seconds before the close.
-4. **Reads** the Binance BTC/USDT 5m candle in progress — the exact candle Futuur settles
-   on. Its open must equal the event's price to beat (the line check), and its latest
-   close is where the market would settle right now.
+4. **Reads** the pair's Binance 5m candle in progress — the exact candle Futuur settles
+   on. Its open must equal the event's price to beat (the line check, within 0.0015% of
+   the price), and its latest close is where the market would settle right now.
 5. **Decides**: the side spot is on, with a probability from a driftless walk over the
    seconds left (`src/edge.ts`, volatility from the last hour × `FIVEMIN_VOL_MULT`).
    Below `FIVEMIN_MIN_PROB` it skips.
@@ -29,6 +29,25 @@ minute before the close. Each run:
    `FIVEMIN_MIN_EDGE` below the probability, capped by Kelly on the running average
    price. That is roughly all-in near certainty and about half the bankroll at 80%.
 7. **Bets** with one limit order at the deepest level touched, and **records** the round.
+
+### Assets
+
+The same product exists for three pairs, and the bot plays all of them (`src/assets.ts`):
+
+| Asset | Futuur category | Binance pair | Ledger (`pk FIVEMIN`) | Rounds | Dashboard |
+| --- | --- | --- | --- | --- | --- |
+| Bitcoin | 3728 `bitcoin-5min` | BTCUSDT | `sk STATE` | `pk ROUND5` | `/` |
+| Ethereum | 3729 `ethereum-5min` | ETHUSDT | `sk STATE#ETH` | `pk ROUND5#ETH` | `/eth` |
+| Solana | 3731 `solana-5min` | SOLUSDT | `sk STATE#SOL` | `pk ROUND5#SOL` | `/sol` |
+
+Their windows close at the same instant, so **one invocation plays them all side by
+side** — the waits overlap, and there is one Lambda run per window instead of three. Each
+asset is isolated: its own ledger, its own rounds, and a failure in one does not cost the
+others their round. They share the Futuur wallet, so a round stakes at most
+`min(its ledger's bankroll, wallet balance)`.
+
+`FIVEMIN_ASSETS` (`btc,eth,sol`) picks which ones run. Every other setting below is
+shared by all of them.
 
 ### Why the end of the window
 
@@ -40,30 +59,32 @@ about a minute after the close.
 
 ### Budget
 
-The bot keeps its own ledger (`pk FIVEMIN`, `sk STATE`), seeded once from
-`FIVEMIN_BUDGET` = **10,000 OOM**. A bet's cost is held out of the bankroll until it
+Each asset keeps its own ledger (`pk FIVEMIN`, `sk STATE` for Bitcoin — see
+[Assets](#assets)), seeded once from `FIVEMIN_BUDGET` = **10,000 OOM**. A bet's cost is held out of the bankroll until it
 settles, then the cost plus Futuur's P&L comes back. A round never stakes more than
 `min(ledger bankroll, wallet balance) × FIVEMIN_MAX_FRACTION` — `1`, so all-in is allowed.
 
-To start over with a fresh budget, delete that one item; the next run re-seeds it.
+To start an asset over with a fresh budget, delete its ledger item; the next run
+re-seeds it.
 
 ### Checking progress
 
-Every round is written to `pk ROUND5`, `sk <close time>` — bets and skips alike, with
+Every round is written to the asset's rounds partition, `sk <close time>` — bets and skips alike, with
 the line, spot, gap, seconds left, probability, plan, order id, fill, P&L and bankroll
 after.
 
 | Where | What |
 | --- | --- |
-| `GET /` | Ledger and every round, refreshing every 30s |
-| `GET /rounds?limit=N` | The same as JSON (default 288 = one day) |
-| CloudWatch, `FiveMinuteBitcoinBet` | `bet placed` / `skipped` / `settled` log lines per run |
+| `GET /`, `/eth`, `/sol` | One asset's ledger and every round, refreshing every 30s |
+| `GET /rounds?asset=eth&limit=N` | The same as JSON (default Bitcoin, 288 = one day) |
+| CloudWatch, `FiveMinuteBitcoinBet` | `bet placed` / `skipped` / `settled` log lines per run, for every asset |
 
 ### Configuration
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `FIVEMIN_BUDGET` | `10000` | Starting bankroll, only read when the ledger is created |
+| `FIVEMIN_ASSETS` | `btc,eth,sol` | Which assets to play |
+| `FIVEMIN_BUDGET` | `10000` | Starting bankroll of each asset, only read when its ledger is created |
 | `FIVEMIN_DECIDE_AT` | `15` | Seconds before the close to decide |
 | `FIVEMIN_LATEST_AT` | `4` | Skip if fewer seconds than this are left |
 | `FIVEMIN_MIN_PROB` | `0.7` | Skip below this probability for the favoured side |

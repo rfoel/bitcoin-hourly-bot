@@ -40,12 +40,18 @@ export interface SideEdge {
   edge: number | null;
 }
 
-const BINANCE_KLINES =
-  "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=60";
+const BINANCE_KLINES = "https://api.binance.com/api/v3/klines";
 
-/** Realised per-second volatility of log returns from the last hour of one-minute closes. */
-export async function realisedVolatility(): Promise<{ sigma: number; samples: number }> {
-  const response = await fetch(BINANCE_KLINES, { signal: AbortSignal.timeout(5_000) });
+/**
+ * Realised per-second volatility of log returns from the last hour of one-minute closes
+ * of a Binance pair.
+ */
+export async function realisedVolatility(
+  symbol = "BTCUSDT",
+): Promise<{ sigma: number; samples: number }> {
+  const response = await fetch(`${BINANCE_KLINES}?symbol=${symbol}&interval=1m&limit=60`, {
+    signal: AbortSignal.timeout(5_000),
+  });
   if (!response.ok) throw new Error(`klines HTTP ${response.status}`);
 
   const rows = (await response.json()) as unknown[];

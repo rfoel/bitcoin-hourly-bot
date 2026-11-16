@@ -1,5 +1,7 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda";
+import { assetOf, DEFAULT_ASSET, enabledAssets } from "./assets.js";
+import type { Asset } from "./assets.js";
 import { placeBet, walletBalance } from "./bet.js";
 import type { BetOverrides } from "./bet.js";
 import { listBets, listNotes, listRuns, putNote, summarise, summariseSpend } from "./store.js";
@@ -22,20 +24,35 @@ export const handler = async (
   if (writes && !authorized(event)) return json(401, { error: "unauthorized" });
 
   try {
+    // The 5-minute dashboard, one page per asset: `/` is the first asset (Bitcoin),
+    // `/eth` and `/sol` the others.
+    const assets = enabledAssets();
+    const page =
+      method !== "GET" ? undefined
+      : path === "/" ? (assets[0] ?? DEFAULT_ASSET)
+      : assets.find((asset) => `/${asset.key}` === path);
+    if (page) {
+      const [ledger, rounds] = await Promise.all([
+        getLedger(page),
+        listRounds(page, limitOf(event, 288)),
+      ]);
+      const onlyBets = event.queryStringParameters?.ver === "apostas";
+      return html(200, renderRounds(page, ledger, rounds, { onlyBets, assets }));
+    }
+
     switch (route) {
       case "GET /health":
         return json(200, { ok: true });
 
-      case "GET /": {
-        const [ledger, rounds] = await Promise.all([getLedger(), listRounds(limitOf(event, 288))]);
-        const onlyBets = event.queryStringParameters?.ver === "apostas";
-        return html(200, renderRounds(ledger, rounds, { onlyBets }));
-      }
-
-      // Every 5-minute round, bet or skipped, with what the bot saw and why it decided.
+      // Every 5-minute round of one asset (`?asset=eth`, Bitcoin by default), bet or
+      // skipped, with what the bot saw and why it decided.
       case "GET /rounds": {
-        const [ledger, rounds] = await Promise.all([getLedger(), listRounds(limitOf(event, 288))]);
-        return json(200, { ledger, rounds });
+        const asset = assetParam(event);
+        const [ledger, rounds] = await Promise.all([
+          getLedger(asset),
+          listRounds(asset, limitOf(event, 288)),
+        ]);
+        return json(200, { asset: asset.key, ledger, rounds });
       }
 
       // The hourly agent's history, from before the bot moved to the 5-minute market.
@@ -128,6 +145,15 @@ function html(statusCode: number, body: string): APIGatewayProxyResultV2 {
     headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
     body,
   };
+}
+
+function assetParam(event: APIGatewayProxyEventV2): Asset {
+  const raw = event.queryStringParameters?.asset;
+  if (!raw) return DEFAULT_ASSET;
+
+  const asset = assetOf(raw);
+  if (!asset) throw new RequestError(`unknown asset "${raw}"`);
+  return asset;
 }
 
 function limitOf(event: APIGatewayProxyEventV2, fallback: number): number {

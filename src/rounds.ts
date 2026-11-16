@@ -8,17 +8,21 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import { Resource } from "sst";
 
+import type { Asset } from "./assets.js";
+
 /**
- * The 5-minute bot's own records, in the same table as the hourly ones:
+ * The 5-minute bot's own records, in the same table as the hourly ones. One ledger and
+ * one set of rounds per asset (see src/assets.ts for each asset's keys):
  *
- *   pk `ROUND5`  sk `<betEndDate>`  — one row per 5-minute round, bet or skipped
- *   pk `FIVEMIN` sk `STATE`         — the bot's bankroll ledger
+ *   pk `ROUND5`      sk `<betEndDate>`  — Bitcoin: one row per round, bet or skipped
+ *   pk `ROUND5#ETH`  sk `<betEndDate>`  — the same for Ethereum (`#SOL` for Solana)
+ *   pk `FIVEMIN`     sk `STATE`         — Bitcoin's bankroll ledger
+ *   pk `FIVEMIN`     sk `STATE#ETH`     — Ethereum's (`STATE#SOL` for Solana)
  *
  * Every round is written, including the ones it skipped and why, so the whole run
  * can be audited afterwards: what it saw, what it decided, what it paid, what came back.
  */
-const ROUND = "ROUND5";
-const LEDGER = { pk: "FIVEMIN", sk: "STATE" };
+const ledgerKey = (asset: Asset) => ({ pk: "FIVEMIN", sk: asset.ledgerSk });
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -40,6 +44,8 @@ export type RoundStatus =
 export interface RoundRecord {
   pk: string;
   sk: string;
+  /** Asset key. Absent on Bitcoin rounds written before there were other assets. */
+  asset?: string;
   eventId: number;
   title: string;
   closesAt: string;
@@ -106,19 +112,20 @@ export interface Ledger {
 }
 
 /** The ledger as it stands, or null before the first run. Never creates it. */
-export async function getLedger(): Promise<Ledger | null> {
-  const found = await client.send(new GetCommand({ TableName: table(), Key: LEDGER }));
+export async function getLedger(asset: Asset): Promise<Ledger | null> {
+  const found = await client.send(new GetCommand({ TableName: table(), Key: ledgerKey(asset) }));
   return (found.Item as Ledger | undefined) ?? null;
 }
 
 /** The ledger, created with `budget` the first time the bot ever runs. */
-export async function loadLedger(budget: number): Promise<Ledger> {
-  const found = await client.send(new GetCommand({ TableName: table(), Key: LEDGER }));
+export async function loadLedger(asset: Asset, budget: number): Promise<Ledger> {
+  const key = ledgerKey(asset);
+  const found = await client.send(new GetCommand({ TableName: table(), Key: key }));
   if (found.Item) return found.Item as Ledger;
 
   const now = new Date().toISOString();
   const ledger: Ledger = {
-    ...LEDGER,
+    ...key,
     startedWith: budget,
     bankroll: budget,
     settledPnl: 0,
@@ -138,16 +145,16 @@ export async function loadLedger(budget: number): Promise<Ledger> {
       }),
     )
     .catch(() => undefined);
-  const again = await client.send(new GetCommand({ TableName: table(), Key: LEDGER }));
+  const again = await client.send(new GetCommand({ TableName: table(), Key: key }));
   return (again.Item as Ledger) ?? ledger;
 }
 
 /** Holds a bet's cost out of the bankroll until it settles. */
-export async function reserve(cost: number): Promise<Ledger> {
+export async function reserve(asset: Asset, cost: number): Promise<Ledger> {
   const result = await client.send(
     new UpdateCommand({
       TableName: table(),
-      Key: LEDGER,
+      Key: ledgerKey(asset),
       UpdateExpression: "SET bankroll = bankroll - :cost, bets = bets + :one, updatedAt = :now",
       ExpressionAttributeValues: {
         ":cost": cost,
@@ -166,6 +173,7 @@ export async function reserve(cost: number): Promise<Ledger> {
  * estimate that was reserved.
  */
 export async function release(
+  asset: Asset,
   reserved: number,
   pnl: number,
   outcome: "won" | "lost" | "unfilled",
@@ -174,7 +182,7 @@ export async function release(
   const result = await client.send(
     new UpdateCommand({
       TableName: table(),
-      Key: LEDGER,
+      Key: ledgerKey(asset),
       UpdateExpression:
         "SET bankroll = bankroll + :back, settledPnl = settledPnl + :pnl, updatedAt = :now" +
         (counter ? `, ${counter} = ${counter} + :one` : ""),
@@ -190,13 +198,17 @@ export async function release(
   return result.Attributes as Ledger;
 }
 
-export async function putRound(round: Omit<RoundRecord, "pk" | "sk">): Promise<RoundRecord> {
-  const record: RoundRecord = { ...round, pk: ROUND, sk: round.closesAt };
+export async function putRound(
+  asset: Asset,
+  round: Omit<RoundRecord, "pk" | "sk" | "asset">,
+): Promise<RoundRecord> {
+  const record: RoundRecord = { ...round, pk: asset.roundPk, sk: round.closesAt, asset: asset.key };
   await client.send(new PutCommand({ TableName: table(), Item: record }));
   return record;
 }
 
 export async function updateRound(
+  asset: Asset,
   sk: string,
   fields: Partial<Omit<RoundRecord, "pk" | "sk">>,
 ): Promise<void> {
@@ -206,7 +218,7 @@ export async function updateRound(
   await client.send(
     new UpdateCommand({
       TableName: table(),
-      Key: { pk: ROUND, sk },
+      Key: { pk: asset.roundPk, sk },
       UpdateExpression: `SET ${entries.map((_, i) => `#k${i} = :v${i}`).join(", ")}`,
       ExpressionAttributeNames: Object.fromEntries(entries.map(([key], i) => [`#k${i}`, key])),
       ExpressionAttributeValues: Object.fromEntries(entries.map(([, value], i) => [`:v${i}`, value])),
@@ -215,12 +227,12 @@ export async function updateRound(
 }
 
 /** Newest rounds first. */
-export async function listRounds(limit = 100): Promise<RoundRecord[]> {
+export async function listRounds(asset: Asset, limit = 100): Promise<RoundRecord[]> {
   const result = await client.send(
     new QueryCommand({
       TableName: table(),
       KeyConditionExpression: "pk = :pk",
-      ExpressionAttributeValues: { ":pk": ROUND },
+      ExpressionAttributeValues: { ":pk": asset.roundPk },
       ScanIndexForward: false,
       Limit: limit,
     }),
@@ -229,7 +241,7 @@ export async function listRounds(limit = 100): Promise<RoundRecord[]> {
 }
 
 /** Rounds still waiting on a result, bounded to the last two days. */
-export async function listPendingRounds(): Promise<RoundRecord[]> {
+export async function listPendingRounds(asset: Asset): Promise<RoundRecord[]> {
   const since = new Date(Date.now() - 2 * 86_400_000).toISOString();
   const result = await client.send(
     new QueryCommand({
@@ -237,7 +249,7 @@ export async function listPendingRounds(): Promise<RoundRecord[]> {
       KeyConditionExpression: "pk = :pk AND sk >= :since",
       FilterExpression: "#status = :pending",
       ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: { ":pk": ROUND, ":since": since, ":pending": "pending" },
+      ExpressionAttributeValues: { ":pk": asset.roundPk, ":since": since, ":pending": "pending" },
     }),
   );
   return (result.Items ?? []) as RoundRecord[];

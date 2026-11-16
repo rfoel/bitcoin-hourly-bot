@@ -1,5 +1,7 @@
 import type { CreateOrderBody, Currency, FuturEvent, Position } from "futuur";
 
+import { enabledAssets } from "./assets.js";
+import type { Asset } from "./assets.js";
 import { listSides, parsePriceToBeat, sdk, walletBalance } from "./bet.js";
 import { fairValue, realisedVolatility } from "./edge.js";
 import {
@@ -16,17 +18,20 @@ import { planOrder } from "./plan.js";
 import type { Plan } from "./plan.js";
 
 /**
- * Bets the Futuur "Bitcoin Up or Down — 5 min" market in its last seconds.
+ * Bets Futuur's "Up or Down — 5 min" markets in their last seconds: Bitcoin, Ethereum
+ * and Solana (src/assets.ts), each with its own bankroll.
  *
- * Fires once per 5-minute window, a minute before the close. It settles the rounds
- * that have resolved since the last run, sleeps until FIVEMIN_DECIDE_AT seconds before
- * the close, then reads the Binance candle the market settles against and decides.
+ * Fires once per 5-minute window, a minute before the close. The assets' windows close
+ * at the same instant, so one invocation plays them all side by side instead of one
+ * Lambda each. For every asset it settles the rounds that have resolved since the last
+ * run, sleeps until FIVEMIN_DECIDE_AT seconds before the close, then reads the Binance
+ * candle the market settles against and decides.
  *
- * Why the end of the window: Futuur's book on this market is a static ladder centred
- * on 0.50 (0.51 × 577, 0.52 × 1155, … up to 0.99) that does not reprice as BTC moves.
- * Watched live, it still asked 0.51 for "Up" with 10s left and spot $62 above the line.
- * With seconds left the side spot is on is close to decided, and the ladder sells it
- * at a coin-flip price. The closer to the close, the stronger that gap.
+ * Why the end of the window: Futuur's book on these markets is a static ladder centred
+ * on 0.50 (0.51 × 577, 0.52 × 1155, … up to 0.99) that does not reprice as the price
+ * moves. Watched live on Bitcoin, it still asked 0.51 for "Up" with 10s left and spot
+ * $62 above the line. With seconds left the side spot is on is close to decided, and
+ * the ladder sells it at a coin-flip price. The closer to the close, the stronger that gap.
  *
  * The side's probability comes from the same driftless-walk model as the hourly bot,
  * with volatility inflated for safety. The bot buys only ask levels priced at least
@@ -35,12 +40,17 @@ import type { Plan } from "./plan.js";
  * smaller, or nothing, when spot is near the line.
  */
 
-const CATEGORY = Number(process.env.FIVEMIN_CATEGORY_ID ?? "3728");
+/**
+ * How far Futuur's line may sit from the Binance candle's open, as a share of the
+ * price: about $1 on Bitcoin, and less than one tick on Solana.
+ */
+const LINE_TOLERANCE = 1.5e-5;
+
 const CURRENCY = (process.env.FUTUUR_CURRENCY ?? "OOM") as Currency;
 const CURRENCY_MODE = CURRENCY === "OOM" ? "play_money" : "real_money";
 
 const config = () => ({
-  /** Starting bankroll, read only the first time the ledger is created. */
+  /** Starting bankroll of each asset, read only the first time its ledger is created. */
   budget: num("FIVEMIN_BUDGET", 10_000),
   /** Seconds before the close to read the market and decide. */
   decideAt: num("FIVEMIN_DECIDE_AT", 15),
@@ -54,29 +64,54 @@ const config = () => ({
   maxFraction: num("FIVEMIN_MAX_FRACTION", 1),
   /** Multiplier on the Kelly stake. 1 = full Kelly. */
   kelly: num("FIVEMIN_KELLY", 1),
-  /** Inflates realised volatility: BTC's tails over 10s are fatter than a walk's. */
+  /** Inflates realised volatility: crypto's tails over 10s are fatter than a walk's. */
   volMult: num("FIVEMIN_VOL_MULT", 1.5),
   /** Smallest stake worth placing. */
   minStake: num("FIVEMIN_MIN_STAKE", 10),
   dryRun: (process.env.FIVEMIN_DRY_RUN ?? "false") === "true",
 });
 
+type Config = ReturnType<typeof config>;
+
 export const handler = async () => {
   const cfg = config();
-  await loadLedger(cfg.budget);
+  const assets = enabledAssets();
+
+  // Side by side: the waits overlap, so three assets take no longer than one. Each is
+  // isolated — one asset failing must not cost the others their round.
+  const results = await Promise.all(
+    assets.map((asset) =>
+      play(asset, cfg).catch((error: unknown) => {
+        console.error("asset failed", { asset: asset.key, error });
+        return { settled: [], round: null, error: error instanceof Error ? error.message : String(error) };
+      }),
+    ),
+  );
+  return Object.fromEntries(assets.map((asset, i) => [asset.key, results[i]]));
+};
+
+/** One asset's round: settle what resolved, wait for the last seconds, decide, bet. */
+async function play(asset: Asset, cfg: Config) {
+  await loadLedger(asset, cfg.budget);
 
   // Settle first: the previous round resolved about a minute after it closed, and
   // its payout is what this round gets to stake.
-  const settled = await settlePending().catch((error: unknown) => {
-    console.error("settling failed", error);
+  const settled = await settlePending(asset).catch((error: unknown) => {
+    console.error("settling failed", { asset: asset.key, error });
     return [];
   });
 
-  const event = await currentEvent();
+  const event = await currentEvent(asset);
   if (!event) {
-    console.warn("no open 5-minute event closing in the next few minutes");
+    console.warn("no open 5-minute event closing in the next few minutes", { asset: asset.key });
     return { settled, round: null };
   }
+
+  const skip = (
+    base: Pick<RoundRecord, "eventId" | "title" | "closesAt" | "dryRun">,
+    reason: string,
+    facts: Partial<RoundRecord> = {},
+  ) => skipRound(asset, base, reason, facts);
 
   const closesAt = event.bet_end_date!;
   const close = Date.parse(closesAt);
@@ -86,7 +121,7 @@ export const handler = async () => {
 
   try {
     // Everything that does not need to be fresh is read before the wait.
-    const vol = await realisedVolatility().catch(() => null);
+    const vol = await realisedVolatility(asset.symbol).catch(() => null);
     const side = (direction: "up" | "down") => sideOf(event, direction);
 
     await sleepUntil(close - cfg.decideAt * 1000);
@@ -98,12 +133,12 @@ export const handler = async () => {
     }
 
     const [candle, wallet, current] = await Promise.all([
-      binanceCandle(),
+      binanceCandle(asset.symbol),
       walletBalance(CURRENCY).catch((error: unknown) => {
         console.error("wallet balance unavailable", error);
         return null;
       }),
-      loadLedger(cfg.budget),
+      loadLedger(asset, cfg.budget),
     ]);
 
     const priceToBeat = lineOf(event);
@@ -139,7 +174,7 @@ export const handler = async () => {
 
     // The line check: Futuur settles on the Binance 5m candle, so its price to beat
     // should be that candle's open. If not, spot is being compared with the wrong line.
-    if (Math.abs(candle.open - priceToBeat) > 1) {
+    if (Math.abs(candle.open - priceToBeat) > priceToBeat * LINE_TOLERANCE) {
       return finish(
         settled,
         await skip(base, `line mismatch: Futuur ${priceToBeat} vs Binance open ${candle.open}`, facts),
@@ -207,8 +242,8 @@ export const handler = async () => {
 
     // Held out of the bankroll until the round settles, so the next round can never
     // stake money that is still riding on this one.
-    const after = await reserve(plan.cost);
-    const round = await putRound({
+    const after = await reserve(asset, plan.cost);
+    const round = await putRound(asset, {
       ...base,
       ...priced,
       ...planned(plan),
@@ -222,11 +257,11 @@ export const handler = async () => {
     console.log("bet placed", round);
     return finish(settled, round);
   } catch (error) {
-    console.error("round failed", error);
+    console.error("round failed", { asset: asset.key, error });
     const message = error instanceof Error ? error.message : String(error);
     // An order that went through is still at stake: record it as pending so the next
     // run settles it, rather than losing track of the money.
-    const round = await putRound({
+    const round = await putRound(asset, {
       ...base,
       ...(placed ?? {}),
       status: placed ? "pending" : "failed",
@@ -235,12 +270,12 @@ export const handler = async () => {
     });
     return finish(settled, round);
   }
-};
+}
 
 /** The open event closing soonest, as long as it closes within this window. */
-async function currentEvent(): Promise<FuturEvent | undefined> {
+async function currentEvent(asset: Asset): Promise<FuturEvent | undefined> {
   const { results } = await sdk.listEvents({
-    categories: [CATEGORY],
+    categories: [asset.category],
     currency_mode: CURRENCY_MODE,
     ordering: "bet_end_date",
     limit: 20,
@@ -274,12 +309,14 @@ function sideOf(event: FuturEvent, direction: "up" | "down") {
 }
 
 /**
- * The Binance BTC/USDT 5m candle in progress: its open is the market's line, its
- * close so far is the price the market will settle on if nothing else trades.
+ * The pair's Binance 5m candle in progress: its open is the market's line, its close
+ * so far is the price the market will settle on if nothing else trades.
  */
-async function binanceCandle(): Promise<{ open: number; close: number; openTime: number }> {
+async function binanceCandle(
+  symbol: string,
+): Promise<{ open: number; close: number; openTime: number }> {
   const response = await fetch(
-    "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=1",
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=5m&limit=1`,
     { signal: AbortSignal.timeout(3_000) },
   );
   if (!response.ok) throw new Error(`binance klines HTTP ${response.status}`);
@@ -318,8 +355,10 @@ async function placeOrder(event: FuturEvent, market: number, position: Position,
  * Settles every pending round whose market has resolved. The P&L is Futuur's own
  * number off the wager, so the ledger tracks what was really paid and paid out.
  */
-async function settlePending(): Promise<{ closesAt: string; status: string; pnl: number }[]> {
-  const pending = await listPendingRounds();
+async function settlePending(
+  asset: Asset,
+): Promise<{ closesAt: string; status: string; pnl: number }[]> {
+  const pending = await listPendingRounds(asset);
   const out: { closesAt: string; status: string; pnl: number }[] = [];
 
   for (const round of pending) {
@@ -359,8 +398,8 @@ async function settlePending(): Promise<{ closesAt: string; status: string; pnl:
       }
 
       pnl = round2(pnl);
-      const ledger = await release(round.cost ?? 0, pnl, status);
-      await updateRound(round.sk, {
+      const ledger = await release(asset, round.cost ?? 0, pnl, status);
+      await updateRound(asset, round.sk, {
         status,
         pnl,
         wagerId: wager?.id,
@@ -369,21 +408,28 @@ async function settlePending(): Promise<{ closesAt: string; status: string; pnl:
         bankrollAfter: ledger.bankroll,
         settledAt: new Date().toISOString(),
       });
-      console.log("settled", { closesAt: round.closesAt, status, pnl, bankroll: ledger.bankroll });
+      console.log("settled", {
+        asset: asset.key,
+        closesAt: round.closesAt,
+        status,
+        pnl,
+        bankroll: ledger.bankroll,
+      });
       out.push({ closesAt: round.closesAt, status, pnl });
     } catch (error) {
-      console.error("could not settle round", { sk: round.sk, error });
+      console.error("could not settle round", { asset: asset.key, sk: round.sk, error });
     }
   }
   return out;
 }
 
-async function skip(
+async function skipRound(
+  asset: Asset,
   base: Pick<RoundRecord, "eventId" | "title" | "closesAt" | "dryRun">,
   reason: string,
   facts: Partial<RoundRecord> = {},
 ): Promise<RoundRecord> {
-  const round = await putRound({ ...base, ...facts, status: "skipped", reason });
+  const round = await putRound(asset, { ...base, ...facts, status: "skipped", reason });
   console.log("skipped", round);
   return round;
 }

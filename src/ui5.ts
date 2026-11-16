@@ -1,40 +1,56 @@
+import type { Asset } from "./assets.js";
 import type { Ledger, RoundRecord } from "./rounds.js";
 
 /**
- * The 5-minute bot's page, in Portuguese and written to be read by someone who has not
- * seen the code: the bankroll first, then how it got there, then how the bot thinks,
- * then its last decision spelled out, then every round.
+ * The 5-minute bot's page, in Portuguese, built to be read at a glance rather than
+ * explained: the bankroll, the window that is open right now, the last 24 hours, the
+ * bankroll's curve, and — folded away — every round.
  *
- * Server-rendered. The only script is progressive: a live countdown and a hover readout
- * on the bankroll chart. Every value it shows is also in the table, so nothing is gated
- * behind it.
+ *  - "Agora" draws the asset's price second by second inside the current window, against
+ *    the price it has to beat: above the line is Sobe, below is Desce, and the strip at the
+ *    end is where the bot decides. That picture is the whole strategy. The prices come
+ *    straight from Binance's public market-data API in the browser — the same candle
+ *    Futuur settles on — so the page never waits on our backend for them.
+ *  - "Últimas 24 horas" is a dot per 5-minute window: one column per hour, twelve rows.
+ *    Filled blue is a bet won, a red ring a bet lost, the size is the stake; grey is a
+ *    round skipped. Under each column, a bar with what that hour made or lost.
+ *
+ * Server-rendered; the script only adds the live price, the clock, tooltips and a refresh
+ * every 30 seconds (without it, the page falls back to a plain reload).
  *
  * Colour: gain/loss is polarity, so it is the diverging pair (blue ↔ red), validated in
- * both modes (CVD ΔE 21.6 light / 19.2 dark). Won/lost chips are status and always carry
- * an icon and a word. Text never wears a series colour.
+ * both modes — and doubled by shape, filled against ring and up against down. Status chips
+ * always carry an icon and a word. Text never wears a series colour.
  */
 
 export interface RoundsView {
   /** Only rounds where the bot actually bet. */
   onlyBets?: boolean;
+  /** Every asset the bot plays, for the switcher. The first one lives at `/`. */
+  assets?: Asset[];
 }
 
 const TZ = "America/Sao_Paulo";
 const MIN_PROB = Number(process.env.FIVEMIN_MIN_PROB ?? "0.7");
 const DECIDE_AT = Number(process.env.FIVEMIN_DECIDE_AT ?? "15");
+const WINDOW_MS = 300_000;
+const HOURS = 24;
 
 export function renderRounds(
+  asset: Asset,
   ledger: Ledger | null,
   rounds: RoundRecord[],
   view: RoundsView = {},
 ): string {
+  const assets = view.assets ?? [asset];
+  const pathOf = (a: Asset) => (a.key === assets[0]?.key ? "/" : `/${a.key}`);
+  const home = pathOf(asset);
   const settled = rounds
     .filter((r) => r.status === "won" || r.status === "lost")
     .sort((a, b) => a.closesAt.localeCompare(b.closesAt));
   const pending = rounds.filter((r) => r.status === "pending");
   const atStake = pending.reduce((sum, r) => sum + (r.cost ?? 0), 0);
   const equity = ledger ? ledger.bankroll + atStake : null;
-  const latest = rounds.find((r) => r.prob !== undefined);
   const shown = (view.onlyBets ? rounds.filter(isBet) : rounds).slice(0, 120);
 
   return `<!doctype html>
@@ -42,114 +58,246 @@ export function renderRounds(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="30">
-<title>${equity === null ? "" : `${int(equity)} OOM · `}Bitcoin 5 min</title>
+<noscript><meta http-equiv="refresh" content="30"></noscript>
+<title>${equity === null ? "" : `${int(equity)} OOM · `}${esc(asset.name)} 5 min</title>
 <style>${CSS}</style>
 </head>
 <body>
 <main>
-  <header class="top">
-    <div>
-      <div class="eyebrow"><span class="live" aria-hidden="true"></span> Robô ao vivo · Futuur · dinheiro de mentira (OOM)</div>
-      <h1>Bitcoin sobe ou desce em 5 minutos</h1>
-    </div>
-    <div class="next">
-      <div class="k">Próxima decisão em</div>
-      <div class="countdown" id="countdown" data-decide-at="${DECIDE_AT}">—</div>
-    </div>
+  <header class="bar">
+    <div class="eyebrow"><span class="live" aria-hidden="true"></span> Ao vivo · OOM de mentira</div>
+    ${assets.length > 1 ? `<nav class="pills" aria-label="Mercado">${assets.map((a) => `<a href="${pathOf(a)}" ${a.key === asset.key ? 'aria-current="true"' : ""}>${esc(a.name)}</a>`).join("")}</nav>` : ""}
   </header>
 
-  ${ledger === null ? emptyState() : summary(ledger, equity!, atStake, pending.length, rounds)}
-
-  <section class="card">
-    <h2>Evolução da banca</h2>
-    <p class="caption">Banca depois de cada aposta liquidada. A linha cinza é o valor inicial — acima dela o robô está ganhando.</p>
-    ${bankrollChart(ledger, settled)}
+  <section class="card top" id="live-hero" data-live>
+    ${ledger === null ? emptyState() : hero(asset, ledger, equity!, atStake)}
   </section>
 
-  <section class="card">
-    <h2>Resultado de cada aposta</h2>
-    <p class="caption">Quanto cada rodada ganhou (para cima, azul) ou perdeu (para baixo, vermelho), em OOM.${settled.length > 0 ? ` Últimas ${Math.min(settled.length, 60)} apostas.` : ""}</p>
-    ${pnlChart(settled.slice(-60))}
-  </section>
+  ${now(asset, rounds)}
 
-  <div class="two">
-    ${howItWorks()}
-    ${latest ? lastDecision(latest) : ""}
+  <div id="live-body" data-live>
+    <section class="card">
+      <div class="head">
+        <h2>Últimas 24 horas</h2>
+        <div class="legend">
+          <span><i class="sw won"></i>ganhou</span>
+          <span><i class="sw lost"></i>perdeu</span>
+          <span><i class="sw pending"></i>aguardando</span>
+          <span><i class="sw skipped"></i>pulou</span>
+          <span class="muted">tamanho = quanto apostou</span>
+        </div>
+      </div>
+      ${dayGrid(rounds)}
+    </section>
+
+    <section class="card">
+      <div class="head"><h2>Banca</h2></div>
+      ${bankrollChart(ledger, settled)}
+    </section>
   </div>
 
-  <section class="card">
-    <div class="table-head">
-      <h2>Todas as rodadas</h2>
-      <nav class="filters" aria-label="Filtrar rodadas">
-        <a href="/" ${view.onlyBets ? "" : 'aria-current="true"'}>Todas</a>
-        <a href="/?ver=apostas" ${view.onlyBets ? 'aria-current="true"' : ""}>Só apostas</a>
-        <a href="/rounds">JSON</a>
-      </nav>
-    </div>
-    <p class="caption">Horário de Brasília. Uma linha por janela de 5 minutos, inclusive as que o robô pulou — com o motivo.</p>
-    ${table(shown)}
-  </section>
+  <details class="card rounds" ${view.onlyBets ? "open" : ""}>
+    <summary><h2>Todas as rodadas</h2></summary>
+    <nav class="pills small-pills" aria-label="Filtrar rodadas">
+      <a href="${home}" ${view.onlyBets ? "" : 'aria-current="true"'}>Todas</a>
+      <a href="${home}?ver=apostas" ${view.onlyBets ? 'aria-current="true"' : ""}>Só apostas</a>
+    </nav>
+    <div id="live-table" data-live>${table(shown)}</div>
+  </details>
 
-  <footer>Atualiza sozinho a cada 30s · <a href="/hourly">histórico do robô horário</a></footer>
+  <footer><a href="/rounds?asset=${asset.key}">JSON</a> · <a href="/hourly">robô horário</a></footer>
 </main>
 <script>${SCRIPT}</script>
 </body>
 </html>`;
 }
 
-/* ── Summary ─────────────────────────────────────────────────────────────── */
+/* ── Hero ────────────────────────────────────────────────────────────────── */
 
-function summary(
-  ledger: Ledger,
-  equity: number,
-  atStake: number,
-  pendingCount: number,
-  rounds: RoundRecord[],
-): string {
+function hero(asset: Asset, ledger: Ledger, equity: number, atStake: number): string {
   const pnl = equity - ledger.startedWith;
-  const decided = ledger.won + ledger.lost;
-  const skipped = rounds.filter((r) => r.status === "skipped").length;
   const pct = ledger.startedWith > 0 ? (pnl / ledger.startedWith) * 100 : 0;
+  const decided = ledger.won + ledger.lost;
 
-  return `<section class="hero card">
-    <div class="hero-main">
-      <div class="k">Banca agora</div>
+  return `<div>
+      <div class="k">Banca · ${esc(asset.name)}</div>
       <div class="hero-value">${big(equity)} <span class="unit">OOM</span></div>
       <div class="delta ${pnl >= 0 ? "up" : "down"}">
         <span aria-hidden="true">${pnl >= 0 ? "▲" : "▼"}</span>
-        ${signedBig(pnl)} OOM (${Math.abs(pct) >= 1000 ? signedBig(pct) : signed(pct, 1)}%) desde o início com ${int(ledger.startedWith)}
+        ${signedBig(pnl)} (${Math.abs(pct) >= 1000 ? signedBig(pct) : signed(pct, 1)}%)
+        <span class="muted">desde ${int(ledger.startedWith)}</span>
       </div>
-      <div class="k small">Começou em ${when(ledger.startedAt, true)}</div>
     </div>
-    <div class="tiles">
-      ${tile("Acertos", decided === 0 ? "—" : `${Math.round((ledger.won / decided) * 100)}%`, `${ledger.won} ganhas · ${ledger.lost} perdidas`)}
-      ${tile("Apostas feitas", int(ledger.bets), `${skipped} rodadas puladas nas últimas ${rounds.length}`)}
-      ${tile("Em jogo agora", big(atStake), pendingCount === 0 ? "nenhuma aposta aberta" : `${pendingCount} aposta esperando resultado`)}
-      ${tile("Resultado liquidado", signedBig(ledger.settledPnl), "lucro ou prejuízo já pago pela Futuur")}
-    </div>
-  </section>`;
+    <dl class="stats">
+      ${stat("Acertos", decided === 0 ? "—" : `${Math.round((ledger.won / decided) * 100)}%`, `${ledger.won} de ${decided}`)}
+      ${stat("Apostas", int(ledger.bets), "no total")}
+      ${stat("Em jogo", big(atStake), "OOM")}
+    </dl>`;
 }
 
-function tile(label: string, value: string, note: string): string {
-  return `<div class="tile"><div class="k">${esc(label)}</div><div class="tile-value">${esc(value)}</div><div class="k small">${esc(note)}</div></div>`;
+function stat(label: string, value: string, note: string): string {
+  return `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd><span>${esc(note)}</span></div>`;
 }
 
 function emptyState(): string {
-  return `<section class="card empty">
-    <h2>Ainda não houve nenhuma rodada</h2>
-    <p>A banca de 10.000 OOM é criada na primeira execução. O robô roda a cada 5 minutos — volte em instantes.</p>
+  return `<div class="empty">
+    <h2>Nenhuma rodada ainda</h2>
+    <p>A banca de 10.000 OOM nasce na primeira execução. Volte em instantes.</p>
+  </div>`;
+}
+
+/* ── Now: the open window, live ──────────────────────────────────────────── */
+
+/**
+ * The card the script fills with Binance's live price. The server only supplies the last
+ * few rounds, so the script can say what the bot did in this window and the one before.
+ */
+function now(asset: Asset, rounds: RoundRecord[]): string {
+  const recent = rounds.slice(0, 4).map((r) => ({
+    c: Date.parse(r.closesAt),
+    s: r.status,
+    side: r.side ?? null,
+    cost: r.cost ?? 0,
+    prob: r.prob ?? null,
+    pnl: r.pnl ?? null,
+    why: shortSkip(r),
+  }));
+
+  return `<section class="card now" id="now" data-symbol="${esc(asset.symbol)}" data-decide-at="${DECIDE_AT}" data-rounds='${esc(JSON.stringify(recent))}'>
+    <div class="now-head">
+      <div>
+        <div class="k">Agora · ${esc(asset.name)}</div>
+        <div class="now-price"><span id="now-price">—</span> <span id="now-gap" class="gap"></span></div>
+      </div>
+      <div class="clock">
+        <div class="k" id="countdown-label">Decide em</div>
+        <div class="countdown" id="countdown">—</div>
+      </div>
+    </div>
+    <figure class="race">
+      <svg viewBox="0 0 760 240" preserveAspectRatio="none" role="img" aria-label="Preço do ${esc(asset.name)} na janela de 5 minutos atual, contra o preço de abertura">
+        <rect class="zone-up" x="0" y="0" width="760" height="120"/>
+        <rect class="zone-down" x="0" y="120" width="760" height="120"/>
+        <rect class="zone-act" y="0" height="240" x="740" width="20"/>
+        <line class="beat" x1="0" x2="760" y1="120" y2="120"/>
+        <path class="price"/>
+      </svg>
+      <span class="tag tag-up">↑ Sobe</span>
+      <span class="tag tag-down">↓ Desce</span>
+      <span class="tag tag-act">robô decide</span>
+      <span class="tag tag-beat" id="beat-label"></span>
+      <i class="head-dot" aria-hidden="true"></i>
+      <div class="race-msg" id="race-msg">Carregando preço…</div>
+    </figure>
+    <div class="now-foot">
+      <span id="now-status">O robô aposta nos últimos ${DECIDE_AT}s, no lado em que o preço estiver.</span>
+      <span id="now-prev" class="muted"></span>
+    </div>
   </section>`;
 }
 
-/* ── Charts ──────────────────────────────────────────────────────────────── */
+/* ── The last 24 hours, a dot per window ─────────────────────────────────── */
+
+/** Index of the 5-minute window a round covers, counted from the epoch. */
+function slotOf(r: RoundRecord): number {
+  return Math.round(Date.parse(r.closesAt) / WINDOW_MS) - 1;
+}
+
+/**
+ * One column per clock hour (Brasília is a whole number of hours from UTC, so twelve
+ * windows are exactly one of its hours), the current hour on the right. Under the dots,
+ * each hour's settled result as a bar.
+ */
+function dayGrid(rounds: RoundRecord[]): string {
+  const nowSlot = Math.floor(Date.now() / WINDOW_MS);
+  const nowHour = Math.floor(nowSlot / 12);
+  const bySlot = new Map(rounds.map((r) => [slotOf(r), r]));
+  const biggest = Math.max(1, ...rounds.filter(isBet).map((r) => r.cost ?? 0));
+
+  const C = 30, L = 36, R = 6, BAR = 64, GAP = 14;
+  const width = L + HOURS * C + R;
+  const top = 4, mat = 12 * C, barMid = top + mat + GAP + BAR / 2;
+  const height = top + mat + GAP + BAR + 22;
+
+  const hourNet: { pnl: number; bets: number }[] = [];
+  const cells: string[] = [];
+  for (let col = 0; col < HOURS; col++) {
+    const hour = nowHour - (HOURS - 1 - col);
+    let pnl = 0, bets = 0;
+    for (let row = 0; row < 12; row++) {
+      const k = hour * 12 + row;
+      if (k > nowSlot) continue;
+      const cx = L + col * C + C / 2, cy = top + row * C + C / 2;
+      const r = bySlot.get(k);
+      const win = `${timeFmt.format((k) * WINDOW_MS)}–${timeFmt.format((k + 1) * WINDOW_MS)}`;
+      if (k === nowSlot && !r) {
+        cells.push(`<circle class="dot-now" cx="${cx}" cy="${cy}" r="10"/><rect class="hit" x="${cx - C / 2}" y="${cy - C / 2}" width="${C}" height="${C}" data-a="${win}" data-b="Janela aberta agora"/>`);
+        continue;
+      }
+      if (!r) {
+        cells.push(`<circle class="dot-none" cx="${cx}" cy="${cy}" r="1.6"/>`);
+        continue;
+      }
+      if (r.status === "won" || r.status === "lost") { pnl += r.pnl ?? 0; bets++; }
+      const bet = isBet(r);
+      const radius = bet ? 3.5 + 8 * Math.sqrt(Math.min(1, (r.cost ?? 0) / biggest)) : 3;
+      const cls = bet ? r.status : r.status === "failed" ? "failed" : "skipped";
+      const [a, b] = tipOf(r);
+      cells.push(`<circle class="dot ${cls}" cx="${cx}" cy="${cy}" r="${radius.toFixed(1)}"/><rect class="hit" x="${cx - C / 2}" y="${cy - C / 2}" width="${C}" height="${C}" data-a="${esc(`${win} · ${a}`)}" data-b="${esc(b)}"/>`);
+    }
+    hourNet.push({ pnl, bets });
+  }
+
+  const maxAbs = Math.max(1, ...hourNet.map((h) => Math.abs(h.pnl)));
+  const bars = hourNet.map((h, col) => {
+    const hour = nowHour - (HOURS - 1 - col);
+    const x = L + col * C + 7, label = `${hourFmt.format(hour * 3_600_000)}h`;
+    const tip = `<rect class="hit" x="${L + col * C}" y="${barMid - BAR / 2}" width="${C}" height="${BAR}" data-a="${label}" data-b="${h.bets === 0 ? "nenhuma aposta liquidada" : `${signedBig(h.pnl)} OOM em ${h.bets} aposta${h.bets === 1 ? "" : "s"}`}"/>`;
+    const tick = col === HOURS - 1 ? `<text class="tick" x="${L + col * C + C / 2}" y="${height - 4}" text-anchor="middle">agora</text>`
+      : col % 3 === 2 ? `<text class="tick" x="${L + col * C + C / 2}" y="${height - 4}" text-anchor="middle">${label}</text>` : "";
+    if (h.bets === 0) return tick + tip;
+    const len = Math.max(2, (Math.abs(h.pnl) / maxAbs) * (BAR / 2 - 2));
+    const y = h.pnl >= 0 ? barMid - len : barMid;
+    return `<rect class="bar-${h.pnl >= 0 ? "up" : "down"}" x="${x}" y="${y.toFixed(1)}" width="${C - 14}" height="${len.toFixed(1)}" rx="2"/>${tick}${tip}`;
+  }).join("");
+
+  const minutes = [0, 3, 6, 9].map((row) =>
+    `<text class="tick" x="${L - 8}" y="${top + row * C + C / 2 + 4}" text-anchor="end">:${String(row * 5).padStart(2, "0")}</text>`).join("");
+
+  const count = (s: string) => rounds.filter((r) => r.status === s).length;
+  const label = `Últimas 24 horas, um ponto por janela de 5 minutos: ${count("won")} apostas ganhas, ${count("lost")} perdidas, ${count("skipped")} rodadas puladas.`;
+
+  return `<figure class="grid24">
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(label)}">
+      ${minutes}
+      <line class="base" x1="${L}" x2="${width - R}" y1="${barMid}" y2="${barMid}"/>
+      ${cells.join("")}
+      ${bars}
+    </svg>
+    <div class="tooltip" hidden><strong></strong><span></span></div>
+  </figure>`;
+}
+
+function tipOf(r: RoundRecord): [string, string] {
+  const side = r.side === "down" ? "↓ Desce" : "↑ Sobe";
+  const stake = r.cost ?? 0;
+  const pick = `${side} · ${chance(r.prob ?? 0)} · ${big(stake)} OOM`;
+  switch (r.status) {
+    case "won": return [`Ganhou ${signedBig(r.pnl ?? 0)}`, pick];
+    case "lost": return [`Perdeu ${big(Math.abs(r.pnl ?? stake))}`, pick];
+    case "pending": return ["Aguardando", pick];
+    default: return [CHIPS[r.status]?.[1] ?? r.status, shortSkip(r)];
+  }
+}
+
+/* ── Bankroll chart ──────────────────────────────────────────────────────── */
 
 const W = 760;
 
 /** Equity after each settled round, rebuilt backwards from the ledger's current total. */
 function bankrollChart(ledger: Ledger | null, settled: RoundRecord[]): string {
   if (!ledger || settled.length === 0) {
-    return `<div class="chart-empty">O gráfico aparece depois da primeira aposta liquidada.</div>`;
+    return `<div class="chart-empty">Aparece depois da primeira aposta liquidada.</div>`;
   }
 
   // The ledger's total is the truth; the window may not reach back to the first round,
@@ -163,7 +311,7 @@ function bankrollChart(ledger: Ledger | null, settled: RoundRecord[]): string {
   }).reverse();
   const series = [{ r: null as RoundRecord | null, value: final - after }, ...points];
 
-  const H = 240;
+  const H = 220;
   const pad = { top: 16, right: 64, bottom: 28, left: 56 };
   const values = [...series.map((p) => p.value), ledger.startedWith];
   const [lo, hi, ticks] = niceScale(Math.min(...values), Math.max(...values));
@@ -184,62 +332,16 @@ function bankrollChart(ledger: Ledger | null, settled: RoundRecord[]): string {
     <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Banca ao longo das apostas: de ${int(series[0]!.value)} para ${int(last.value)} OOM">
       ${ticks.map((t) => `<line class="grid" x1="${pad.left}" x2="${W - pad.right}" y1="${y(t)}" y2="${y(t)}"/><text class="tick" x="${pad.left - 8}" y="${y(t) + 4}" text-anchor="end">${compact(t)}</text>`).join("")}
       <line class="ref" x1="${pad.left}" x2="${W - pad.right}" y1="${y(ledger.startedWith)}" y2="${y(ledger.startedWith)}"/>
-      <text class="ref-label" x="${pad.left + 4}" y="${y(ledger.startedWith) - 6}">início ${int(ledger.startedWith)}</text>
+      <text class="ref-label" x="${pad.left + 4}" y="${y(ledger.startedWith) - 6}">início</text>
       <path class="area" d="${area}"/>
       <path class="line" d="${line}"/>
-      <circle class="dot" cx="${x(series.length - 1)}" cy="${y(last.value)}" r="4"/>
+      <circle class="dot-end" cx="${x(series.length - 1)}" cy="${y(last.value)}" r="4"/>
       <text class="end-label" x="${x(series.length - 1) + 10}" y="${y(last.value) + 4}">${big(last.value)}</text>
-      <text class="tick" x="${pad.left}" y="${H - 8}">${esc(series[1]?.r ? when(series[1].r.closesAt) : "")}</text>
-      <text class="tick" x="${W - pad.right}" y="${H - 8}" text-anchor="end">${esc(last.r ? when(last.r.closesAt) : "")}</text>
       <g class="hover" aria-hidden="true"><line class="cross" y1="${pad.top}" y2="${H - pad.bottom}"/><circle class="hover-dot" r="5"/></g>
-      <rect class="hit" x="${pad.left}" y="0" width="${W - pad.left - pad.right}" height="${H}"/>
+      <rect class="chart-hit" x="${pad.left}" y="0" width="${W - pad.left - pad.right}" height="${H}"/>
     </svg>
     <div class="tooltip" hidden><strong></strong><span></span></div>
   </figure>`;
-}
-
-/** Signed P&L per settled round as diverging columns from a zero baseline. */
-function pnlChart(settled: RoundRecord[]): string {
-  if (settled.length === 0) {
-    return `<div class="chart-empty">Nenhuma aposta liquidada ainda.</div>`;
-  }
-
-  const H = 200;
-  const pad = { top: 12, right: 16, bottom: 12, left: 56 };
-  const pnls = settled.map((r) => r.pnl ?? 0);
-  const [lo, hi, ticks] = niceScale(Math.min(0, ...pnls), Math.max(0, ...pnls));
-  const y = (v: number) => pad.top + (1 - (v - lo) / (hi - lo)) * (H - pad.top - pad.bottom);
-  const slot = (W - pad.left - pad.right) / settled.length;
-  const bar = Math.max(2, Math.min(24, slot - 2));
-  const zero = y(0);
-
-  const columns = settled.map((r, i) => {
-    const v = r.pnl ?? 0;
-    const cx = pad.left + slot * i + slot / 2;
-    const top = Math.min(y(v), zero);
-    const h = Math.max(1, Math.abs(y(v) - zero));
-    const radius = Math.min(4, bar / 2, h);
-    const shape = roundedEnd(cx - bar / 2, top, bar, h, radius, v >= 0 ? "top" : "bottom");
-    const label = `${when(r.closesAt)} · ${r.side === "down" ? "Desce" : "Sobe"} · ${signed(v)} OOM`;
-    return `<g class="col"><rect class="col-hit" x="${pad.left + slot * i}" y="0" width="${slot}" height="${H}"><title>${esc(label)}</title></rect><path class="${v >= 0 ? "gain" : "loss"}" d="${shape}"/></g>`;
-  });
-
-  return `<figure class="chart">
-    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Resultado das últimas ${settled.length} apostas">
-      ${ticks.map((t) => `<line class="grid" x1="${pad.left}" x2="${W - pad.right}" y1="${y(t)}" y2="${y(t)}"/><text class="tick" x="${pad.left - 8}" y="${y(t) + 4}" text-anchor="end">${t > 0 ? "+" : ""}${compact(t)}</text>`).join("")}
-      ${columns.join("")}
-      <line class="baseline" x1="${pad.left}" x2="${W - pad.right}" y1="${zero}" y2="${zero}"/>
-    </svg>
-  </figure>`;
-}
-
-/** A column with 4px rounded corners at its data end and square at the baseline. */
-function roundedEnd(x: number, y: number, w: number, h: number, r: number, end: "top" | "bottom"): string {
-  const f = (n: number) => n.toFixed(1);
-  if (end === "top") {
-    return `M${f(x)},${f(y + h)}V${f(y + r)}Q${f(x)},${f(y)} ${f(x + r)},${f(y)}H${f(x + w - r)}Q${f(x + w)},${f(y)} ${f(x + w)},${f(y + r)}V${f(y + h)}Z`;
-  }
-  return `M${f(x)},${f(y)}V${f(y + h - r)}Q${f(x)},${f(y + h)} ${f(x + r)},${f(y + h)}H${f(x + w - r)}Q${f(x + w)},${f(y + h)} ${f(x + w)},${f(y + h - r)}V${f(y)}Z`;
 }
 
 /** Round bounds and 3–5 clean ticks covering [min, max]. */
@@ -258,92 +360,29 @@ function niceScale(min: number, max: number): [number, number, number[]] {
   return [lo, hi, ticks];
 }
 
-/* ── Explainers ──────────────────────────────────────────────────────────── */
-
-function howItWorks(): string {
-  return `<section class="card">
-    <h2>Como o robô joga</h2>
-    <p class="caption">Uma janela de 5 minutos, em escala:</p>
-    <div class="window" role="img" aria-label="Linha do tempo de uma janela de 5 minutos: o mercado abre no minuto 1, o robô aposta nos últimos ${DECIDE_AT} segundos">
-      <div class="seg closed" style="flex:60">fechado</div>
-      <div class="seg open" style="flex:${240 - DECIDE_AT}">aberto · robô só observa</div>
-      <div class="seg act" style="flex:${DECIDE_AT}"></div>
-    </div>
-    <div class="window-axis">
-      <span style="left:0">0:00</span><span style="left:20%">1:00</span><span style="right:0">5:00</span>
-    </div>
-    <div class="window-note">últimos ${DECIDE_AT}s: o robô aposta <span class="key" aria-hidden="true"></span></div>
-    <ol class="steps">
-      <li><b>A pergunta.</b> O preço do Bitcoin vai fechar estes 5 minutos <b>acima</b> (Sobe) ou <b>abaixo</b> (Desce) do preço em que abriu? A Futuur usa o candle de 5 min da Binance.</li>
-      <li><b>A brecha.</b> A Futuur vende cada lado por cerca de <b>0,51 OOM</b> e não muda esse preço quando o Bitcoin se mexe. Cada cota certa paga <b>1 OOM</b>.</li>
-      <li><b>A leitura.</b> Faltando ${DECIDE_AT} segundos, o robô vê de que lado o preço está e calcula a chance de ele continuar ali até o fim.</li>
-      <li><b>A aposta.</b> Só compra se a chance for de pelo menos ${Math.round(MIN_PROB * 100)}% e o preço for bem menor que essa chance. Quanto maior a certeza, maior a aposta — perto de 99% ela vai quase toda a banca.</li>
-    </ol>
-  </section>`;
-}
-
-/** The most recent decision, spelled out as a sentence and a two-bar comparison. */
-function lastDecision(r: RoundRecord): string {
-  const side = r.side === "down" ? "Desce" : "Sobe";
-  const gap = r.gap ?? 0;
-  const bet = isBet(r);
-  const prob = r.prob ?? 0;
-  const price = r.avgPrice ?? r.bestAsk ?? null;
-  const payout = r.shares ?? 0;
-
-  const outcome =
-    r.status === "won" ? chip("won") + ` <span>Fechou em ${side}: recebeu ${int(payout)} OOM, lucro de ${signed(r.pnl ?? 0)}.</span>`
-    : r.status === "lost" ? chip("lost") + ` <span>Não fechou em ${side}: perdeu ${int(r.cost ?? 0)} OOM.</span>`
-    : r.status === "pending" ? chip("pending") + ` <span>Se fechar em ${side}, recebe ${int(payout)} OOM (lucro de ${signed(payout - (r.cost ?? 0))}). Se não, perde ${int(r.cost ?? 0)}.</span>`
-    : chip(r.status) + ` <span>${esc(explainSkip(r))}</span>`;
-
-  return `<section class="card">
-    <h2>Última decisão</h2>
-    <p class="caption">Rodada que fechou às ${when(r.closesAt)}.</p>
-    <dl class="facts">
-      <div><dt>Preço a bater</dt><dd>$${money(r.priceToBeat ?? 0)}</dd></div>
-      <div><dt>Bitcoin agora</dt><dd>$${money(r.spot ?? 0)}</dd></div>
-      <div><dt>Diferença</dt><dd>${gap >= 0 ? "+" : "−"}$${money(Math.abs(gap))}</dd></div>
-      <div><dt>Faltavam</dt><dd>${(r.secondsLeft ?? 0).toFixed(0)}s</dd></div>
-    </dl>
-    <p class="explain">O Bitcoin estava <b>${gap >= 0 ? "acima" : "abaixo"}</b> da linha, então o lado provável era <b>${side}</b>.</p>
-    <div class="meters">
-      <div class="meter-row"><span>Chance estimada de ${side}</span><div class="track"><div class="fill chance" style="width:${(prob * 100).toFixed(1)}%"></div></div><b>${chance(prob)}</b></div>
-      ${price === null ? "" : `<div class="meter-row"><span>Preço ${bet ? "médio pago" : "na Futuur"} por cota</span><div class="track"><div class="fill price" style="width:${(price * 100).toFixed(1)}%"></div></div><b>${dec(price, 2)}</b></div>`}
-    </div>
-    ${price !== null && prob > price ? `<p class="explain">A diferença entre as duas barras é a <b>vantagem</b>: ${Math.round((prob - price) * 100)} pontos. Pagar ${dec(price, 2)} por algo que vale ${dec(prob, 2)} dá lucro na média.</p>` : ""}
-    ${bet ? `<p class="explain">Comprou <b>${int(r.shares ?? 0)} cotas</b> por <b>${int(r.cost ?? 0)} OOM</b>.</p>` : ""}
-    <p class="outcome">${outcome}</p>
-  </section>`;
-}
-
 /* ── Table ───────────────────────────────────────────────────────────────── */
 
 function table(rounds: RoundRecord[]): string {
   if (rounds.length === 0) return `<div class="chart-empty">Nada por aqui ainda.</div>`;
   return `<div class="table-wrap"><table>
     <thead><tr>
-      <th>Fechou</th><th>Situação</th><th>Lado</th><th class="n">Diferença</th><th class="n">Chance</th>
-      <th class="n">Apostou</th><th class="n">Preço médio</th><th class="n">Resultado</th><th class="n">Banca</th>
+      <th>Hora</th><th>Situação</th><th>Lado</th><th class="n">Chance</th><th class="n">Apostou</th><th class="n">Resultado</th>
     </tr></thead>
     <tbody>${rounds.map(row).join("")}</tbody>
   </table></div>`;
 }
 
 function row(r: RoundRecord): string {
-  const head = `<td>${when(r.closesAt)}</td><td>${chip(r.status)}${r.dryRun ? ' <span class="k small">simulação</span>' : ""}</td>`;
+  const head = `<td>${when(r.closesAt)}</td><td>${chip(r.status)}${r.dryRun ? ' <span class="muted">simulação</span>' : ""}</td>`;
   const side = r.side ? `${r.side === "down" ? "↓ Desce" : "↑ Sobe"}` : "";
-  const gap = r.gap === undefined ? "" : `${r.gap >= 0 ? "+" : "−"}$${money(Math.abs(r.gap))}`;
   const prob = r.prob === undefined ? "" : chance(r.prob);
 
   if (!isBet(r)) {
-    return `<tr class="muted">${head}<td>${side}</td><td class="n">${gap}</td><td class="n">${prob}</td><td colspan="4" class="why">${esc(explainSkip(r))}</td></tr>`;
+    return `<tr class="dim">${head}<td>${side}</td><td class="n">${prob}</td><td colspan="2" class="why">${esc(shortSkip(r))}</td></tr>`;
   }
 
   const pnl = r.pnl === undefined ? "" : `<span class="${r.pnl >= 0 ? "t-up" : "t-down"}">${signed(r.pnl)}</span>`;
-  return `<tr>${head}<td>${side}</td><td class="n">${gap}</td><td class="n">${prob}</td>
-    <td class="n">${int(r.cost ?? 0)}</td><td class="n">${r.avgPrice ? dec(r.avgPrice, 3) : ""}</td>
-    <td class="n">${pnl}</td><td class="n">${r.bankrollAfter === undefined ? "" : int(r.bankrollAfter)}</td></tr>`;
+  return `<tr>${head}<td>${side}</td><td class="n">${prob}</td><td class="n">${int(r.cost ?? 0)}</td><td class="n">${pnl}</td></tr>`;
 }
 
 const CHIPS: Record<string, [string, string]> = {
@@ -360,21 +399,19 @@ function chip(status: string): string {
   return `<span class="chip ${esc(status)}"><span aria-hidden="true">${icon}</span>${esc(label)}</span>`;
 }
 
-/** The handler's skip reasons are terse and in English; this says them plainly. */
-function explainSkip(r: RoundRecord): string {
+/** The handler's skip reasons are terse and in English; this says them in a few words. */
+function shortSkip(r: RoundRecord): string {
   const reason = r.reason ?? "";
   if (r.status === "failed") return `Erro: ${r.error ?? reason}`;
-  if (r.status === "unfilled") return "A ordem não foi executada — nada foi cobrado.";
-  if (reason.startsWith("dry run")) return "Simulação: teria apostado aqui, mas o modo de teste está ligado.";
-  if (r.prob !== undefined && r.prob < MIN_PROB) {
-    return `Perto demais da linha: só ${(r.prob * 100).toFixed(0)}% de chance — praticamente cara ou coroa.`;
-  }
-  if (reason.startsWith("no edge")) return "O preço na Futuur estava alto demais para valer a pena.";
-  if (reason.startsWith("line mismatch")) return "O preço a bater da Futuur não bateu com a Binance — não dava para confiar.";
-  if (reason.startsWith("nothing to stake")) return "Sem saldo para apostar.";
-  if (reason.startsWith("woke up too late")) return "Acordou tarde demais para apostar com segurança.";
-  if (reason.startsWith("order canceled")) return "A Futuur cancelou a ordem — nada foi cobrado.";
-  if (reason.startsWith("no volatility")) return "Não conseguiu medir a volatilidade do Bitcoin.";
+  if (r.status === "unfilled") return "Ordem não executada";
+  if (reason.startsWith("dry run")) return "Simulação";
+  if (r.prob !== undefined && r.prob < MIN_PROB) return `Perto demais da linha (${chance(r.prob)})`;
+  if (reason.startsWith("no edge")) return "Preço alto demais";
+  if (reason.startsWith("line mismatch")) return "Linha não bateu com a Binance";
+  if (reason.startsWith("nothing to stake")) return "Sem saldo";
+  if (reason.startsWith("woke up too late")) return "Acordou tarde";
+  if (reason.startsWith("order canceled")) return "Ordem cancelada";
+  if (reason.startsWith("no volatility")) return "Sem volatilidade";
   return reason;
 }
 
@@ -385,11 +422,6 @@ function chance(p: number): string {
   return `${Math.round(p * 100)}%`;
 }
 
-/** Decimal in Brazilian notation: 0,57. */
-function dec(value: number, digits: number): string {
-  return value.toLocaleString("pt-BR", { minimumFractionDigits: digits, maximumFractionDigits: digits });
-}
-
 function isBet(r: RoundRecord): boolean {
   return r.status === "pending" || r.status === "won" || r.status === "lost";
 }
@@ -397,6 +429,7 @@ function isBet(r: RoundRecord): boolean {
 /* ── Formatting ──────────────────────────────────────────────────────────── */
 
 const timeFmt = new Intl.DateTimeFormat("pt-BR", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+const hourFmt = new Intl.DateTimeFormat("pt-BR", { timeZone: TZ, hour: "2-digit" });
 const dayFmt = new Intl.DateTimeFormat("pt-BR", { timeZone: TZ, day: "2-digit", month: "2-digit" });
 
 function when(iso: string, withDay = false): string {
@@ -407,10 +440,6 @@ function when(iso: string, withDay = false): string {
 
 function int(value: number): string {
   return Math.round(value).toLocaleString("pt-BR");
-}
-
-function money(value: number): string {
-  return value.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function signed(value: number, digits = 0): string {
@@ -432,7 +461,7 @@ function compact(value: number): string {
   return value.toLocaleString("pt-BR", { maximumFractionDigits: 0 });
 }
 
-/** Full figures while they fit a tile, compact past a million. */
+/** Full figures while they fit, compact past a million. */
 function big(value: number): string {
   return Math.abs(value) >= 1e6 ? compact(value) : int(value);
 }
@@ -455,107 +484,146 @@ function esc(value: string): string {
 const CSS = `
 :root {
   color-scheme: light;
-  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
-  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,.10);
-  --gain: #2a78d6; --loss: #e34948; --gain-wash: rgba(42,120,214,.10); --price: #c3c2b7;
+  --page: #eeece4; --surface: #faf9f5; --edge: #d3cfc1; --ink: #0d0d0c; --ink-2: #4f4d48; --muted: #85827a;
+  --grid: #e2dfd4; --axis: #c3c0b3; --ring: rgba(13,13,12,.12);
+  --gain: #2a78d6; --loss: #e34948; --warn: #f5a800; --skip: #c5c0ae;
+  --gain-wash: rgba(42,120,214,.09); --loss-wash: rgba(227,73,72,.08); --warn-wash: rgba(245,168,0,.22);
   --good: #0ca30c; --critical: #d03b3b; --warning: #fab219;
   --t-up: #006300; --t-down: #b42318;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --page: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
-    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,.10);
-    --gain: #3987e5; --loss: #e66767; --gain-wash: rgba(57,135,229,.12); --price: #52514e;
+    --page: #08090c; --surface: #12141a; --edge: #1d2029; --ink: #f0efec; --ink-2: #b9bbc2; --muted: #80838d;
+    --grid: #252831; --axis: #383c47; --ring: rgba(255,255,255,.09);
+    --gain: #3987e5; --loss: #e66767; --warn: #fab219; --skip: #4a5163;
+    --gain-wash: rgba(57,135,229,.12); --loss-wash: rgba(230,103,103,.10); --warn-wash: rgba(250,178,25,.18);
     --t-up: #0ca30c; --t-down: #e66767;
   }
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--page); color: var(--ink);
   font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 64px; display: grid; gap: 20px; }
+main, #live-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+main { max-width: 1080px; margin: 0 auto; padding: 20px 20px 48px; }
 a { color: var(--gain); }
-h1 { font-size: 28px; line-height: 1.2; margin: 4px 0 0; font-weight: 650; letter-spacing: -.01em; }
-h2 { font-size: 17px; margin: 0 0 4px; font-weight: 620; }
-b { font-weight: 620; }
-.k { color: var(--ink-2); font-size: 13px; }
-.small { font-size: 12px; color: var(--muted); }
-.caption { color: var(--ink-2); font-size: 13px; margin: 0 0 16px; }
-.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 16px; padding: 22px 24px; }
-.top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
-.eyebrow { color: var(--ink-2); font-size: 13px; display: flex; align-items: center; gap: 8px; }
-.live { width: 8px; height: 8px; border-radius: 50%; background: var(--good); box-shadow: 0 0 0 3px rgba(12,163,12,.18); }
-.next { text-align: right; }
-.countdown { font-size: 22px; font-weight: 620; font-variant-numeric: tabular-nums; }
+h2 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: -.01em; }
+.k { color: var(--ink-2); font: 500 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; }
+.muted { color: var(--muted); font-weight: 400; }
 
-.hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); gap: 28px; align-items: center; }
-.hero-value { font-size: 52px; line-height: 1.05; font-weight: 650; letter-spacing: -.02em; margin: 4px 0 8px; }
-.unit { font-size: 20px; color: var(--ink-2); font-weight: 500; letter-spacing: 0; }
-.delta { font-size: 14px; font-weight: 560; margin-bottom: 6px; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 18px; padding: 20px 22px;
+  box-shadow: 0 5px 0 var(--edge); position: relative; }
+.head { display: flex; justify-content: space-between; align-items: center; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 12px; }
+
+.bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.eyebrow { color: var(--ink-2); font: 500 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase;
+  display: flex; align-items: center; gap: 10px; }
+.live { width: 8px; height: 8px; border-radius: 50%; background: var(--good); animation: beat 2s ease-out infinite; }
+@keyframes beat { 0% { box-shadow: 0 0 0 0 rgba(12,163,12,.5); } 100% { box-shadow: 0 0 0 9px rgba(12,163,12,0); } }
+.pills { display: flex; gap: 4px; flex-wrap: wrap; }
+.pills a { text-decoration: none; color: var(--ink-2); font-size: 13px; padding: 4px 12px; border-radius: 999px; border: 1px solid var(--ring); }
+.pills a:hover { color: var(--ink); border-color: var(--axis); }
+.pills a[aria-current] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+
+/* Hero */
+.top { display: flex; justify-content: space-between; align-items: flex-end; gap: 20px 32px; flex-wrap: wrap; }
+.hero-value { font-size: clamp(40px, 8vw, 64px); line-height: 1; font-weight: 720; letter-spacing: -.045em; margin: 8px 0 10px;
+  font-variant-numeric: tabular-nums; }
+.unit { font: 500 13px/1 var(--mono); letter-spacing: .06em; color: var(--ink-2); }
+.delta { font-size: 15px; font-weight: 600; }
 .delta.up { color: var(--t-up); } .delta.down { color: var(--t-down); }
-.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.hero-main, .tile { min-width: 0; overflow-wrap: anywhere; }
-.tile { border: 1px solid var(--ring); border-radius: 12px; padding: 14px 16px; }
-.tile-value { font-size: 24px; font-weight: 620; margin: 2px 0; }
+.stats { display: flex; gap: 10px; margin: 0; flex-wrap: wrap; }
+.stats div { border: 1px solid var(--ring); border-radius: 12px; padding: 10px 14px; min-width: 104px; }
+.stats dt { font: 500 11px/1.4 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--ink-2); }
+.stats dd { margin: 2px 0 0; font-size: 24px; font-weight: 680; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.stats span { font-size: 12px; color: var(--muted); }
+.empty h2 { font-size: 22px; margin-bottom: 4px; } .empty p { color: var(--ink-2); margin: 0; }
 
+/* Now */
+.now-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 12px; margin-bottom: 12px; }
+.now-price { font: 650 26px/1.2 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; margin-top: 4px; }
+.gap { font-size: 15px; font-weight: 600; margin-left: 6px; }
+.gap.up { color: var(--t-up); } .gap.down { color: var(--t-down); }
+.clock { text-align: right; }
+.countdown { font: 650 26px/1.2 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; margin-top: 4px; }
+.race { margin: 0; position: relative; height: 240px; }
+.race svg { width: 100%; height: 100%; display: block; overflow: visible; border-radius: 10px; }
+.zone-up { fill: var(--gain-wash); } .zone-down { fill: var(--loss-wash); } .zone-act { fill: var(--warn-wash); }
+.beat { stroke: var(--ink-2); stroke-width: 1.5; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+.price { fill: none; stroke: var(--ink); stroke-width: 2.25; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.tag { position: absolute; font: 600 11px/1 var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--ink-2); pointer-events: none; }
+.tag-up { left: 10px; top: 10px; } .tag-down { left: 10px; bottom: 10px; }
+.tag-act { right: 0; top: 0; bottom: 0; width: 8%; writing-mode: vertical-rl; display: grid; place-items: center; color: var(--ink-2); }
+.tag-beat { left: 10px; transform: translateY(-140%); font-weight: 500; text-transform: none; letter-spacing: 0; font-size: 11px; }
+.head-dot { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--ink);
+  border: 2px solid var(--surface); display: none; }
+.head-dot.up { background: var(--gain); } .head-dot.down { background: var(--loss); }
+.head-dot::after { content: ""; position: absolute; inset: -6px; border-radius: 50%; border: 2px solid currentColor; opacity: 0;
+  animation: ping 1.6s ease-out infinite; color: inherit; }
+.head-dot.up::after { border-color: var(--gain); } .head-dot.down::after { border-color: var(--loss); }
+@keyframes ping { 0% { opacity: .7; transform: scale(.6); } 100% { opacity: 0; transform: scale(1.6); } }
+.race-msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; }
+.race-msg[hidden] { display: none; }
+.now-foot { display: flex; justify-content: space-between; gap: 6px 16px; flex-wrap: wrap; margin-top: 12px; font-size: 14px; color: var(--ink-2); }
+#now-status b { color: var(--ink); }
+
+/* Day grid */
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.sw.won { background: var(--gain); } .sw.lost { border: 2.5px solid var(--loss); }
+.sw.pending { background: var(--warn); } .sw.skipped { background: var(--skip); width: 6px; height: 6px; }
+.grid24 { margin: 0; position: relative; }
+.grid24 svg { width: 100%; height: auto; display: block; }
+.dot.won { fill: var(--gain); }
+.dot.lost { fill: none; stroke: var(--loss); stroke-width: 3; }
+.dot.pending { fill: var(--warn); animation: glow 1.4s ease-in-out infinite alternate; }
+.dot.skipped { fill: var(--skip); }
+.dot.failed { fill: none; stroke: var(--critical); stroke-width: 1.5; }
+.dot-none { fill: var(--grid); }
+.dot-now { fill: none; stroke: var(--ink); stroke-width: 1.5; stroke-dasharray: 3 3; animation: spin 8s linear infinite; transform-box: fill-box; transform-origin: center; }
+@keyframes glow { from { opacity: 1; } to { opacity: .45; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+.bar-up { fill: var(--gain); } .bar-down { fill: var(--loss); }
+.base { stroke: var(--axis); stroke-width: 1; }
+.hit { fill: transparent; }
+.grid24 .hit:hover { fill: var(--ring); }
+
+/* Bankroll chart */
 .chart { margin: 0; position: relative; }
 .chart svg { width: 100%; height: auto; display: block; overflow: visible; }
 .grid { stroke: var(--grid); stroke-width: 1; }
-.baseline { stroke: var(--axis); stroke-width: 1; }
-.ref { stroke: var(--muted); stroke-width: 1; }
+.ref { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; }
 .ref-label, .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .end-label { fill: var(--ink); font-size: 13px; font-weight: 620; }
 .line { fill: none; stroke: var(--gain); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .area { fill: var(--gain-wash); }
-.dot, .hover-dot { fill: var(--gain); stroke: var(--surface); stroke-width: 2; }
+.dot-end, .hover-dot { fill: var(--gain); stroke: var(--surface); stroke-width: 2; }
 .hover { display: none; } .chart.hovering .hover { display: block; }
 .cross { stroke: var(--axis); stroke-width: 1; }
-.hit { fill: transparent; cursor: crosshair; }
-.gain { fill: var(--gain); } .loss { fill: var(--loss); }
-.col-hit { fill: transparent; }
-.col:hover path { opacity: .75; }
+.chart-hit { fill: transparent; cursor: crosshair; }
+.chart-empty { color: var(--muted); padding: 28px 0; text-align: center; border: 1px dashed var(--axis); border-radius: 12px; }
+
 .tooltip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--ring);
-  border-radius: 8px; padding: 6px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
-  display: grid; transform: translate(-50%, calc(-100% - 12px)); white-space: nowrap; }
+  border-radius: 10px; padding: 7px 11px; font-size: 12px; box-shadow: 0 4px 0 var(--edge), 0 10px 24px rgba(0,0,0,.14);
+  display: grid; transform: translate(-50%, calc(-100% - 12px)); white-space: nowrap; z-index: 2; }
 .tooltip[hidden] { display: none; }
-.tooltip strong { font-size: 14px; } .tooltip span { color: var(--ink-2); }
-.chart-empty { color: var(--muted); padding: 28px 0; text-align: center; border: 1px solid var(--grid); border-radius: 12px; }
+.tooltip strong { font-size: 13px; } .tooltip span { color: var(--ink-2); }
 
-.two { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-.two > :only-child { grid-column: 1 / -1; }
-.window { display: flex; gap: 2px; height: 34px; margin-top: 8px; font-size: 12px; }
-.seg { display: flex; align-items: center; justify-content: center; border-radius: 6px; padding: 0 6px; min-width: 0; text-align: center; line-height: 1.15; }
-.seg.closed { background: var(--grid); color: var(--ink-2); }
-.seg.open { background: var(--gain-wash); color: var(--ink-2); border: 1px solid var(--ring); }
-.seg.act { background: var(--gain); min-width: 6px; }
-.window-axis { position: relative; height: 16px; color: var(--muted); font-size: 11px; margin-top: 4px; font-variant-numeric: tabular-nums; }
-.window-axis span { position: absolute; }
-.window-note { text-align: right; font-size: 12px; color: var(--ink-2); margin: 2px 0 14px; display: flex; justify-content: flex-end; align-items: center; gap: 6px; }
-.key { width: 10px; height: 10px; border-radius: 3px; background: var(--gain); }
-.steps { margin: 0; padding-left: 20px; display: grid; gap: 10px; color: var(--ink-2); font-size: 14px; }
-.steps b { color: var(--ink); }
-
-.facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 0 0 12px; }
-.facts div { border: 1px solid var(--ring); border-radius: 10px; padding: 8px 10px; }
-.facts dt { font-size: 11px; color: var(--muted); } .facts dd { margin: 0; font-weight: 620; font-size: 14px; }
-.explain { color: var(--ink-2); font-size: 14px; margin: 10px 0; } .explain b { color: var(--ink); }
-.meters { display: grid; gap: 8px; }
-.meter-row { display: grid; grid-template-columns: 11rem 1fr 3rem; gap: 10px; align-items: center; font-size: 13px; color: var(--ink-2); }
-.meter-row b { text-align: right; color: var(--ink); font-variant-numeric: tabular-nums; }
-.track { height: 8px; border-radius: 4px; background: var(--grid); overflow: hidden; }
-.fill { height: 100%; border-radius: 4px; } .fill.chance { background: var(--gain); } .fill.price { background: var(--muted); }
-.outcome { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; margin: 14px 0 0; font-size: 14px; }
-
-.table-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-.filters { display: flex; gap: 4px; }
-.filters a { text-decoration: none; color: var(--ink-2); font-size: 13px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--ring); }
-.filters a[aria-current] { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+/* Rounds */
+.rounds summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; }
+.rounds summary::-webkit-details-marker { display: none; }
+.rounds summary::after { content: "▾"; color: var(--muted); transition: transform .2s; }
+.rounds[open] summary::after { transform: rotate(180deg); }
+.small-pills { margin: 14px 0 8px; }
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
-th { text-align: left; color: var(--muted); font-weight: 500; font-size: 12px; padding: 8px 10px 8px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
-td { padding: 9px 10px 9px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { text-align: left; color: var(--muted); font: 500 11px/1.4 var(--mono); letter-spacing: .05em; text-transform: uppercase;
+  padding: 8px 10px 8px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+td { padding: 8px 10px 8px 0; border-bottom: 1px solid var(--grid); white-space: nowrap; }
 .n { text-align: right; }
-tr.muted td { color: var(--ink-2); }
+tr.dim td { color: var(--ink-2); }
 td.why { white-space: normal; color: var(--muted); }
 .t-up { color: var(--t-up); font-weight: 600; } .t-down { color: var(--t-down); font-weight: 600; }
 .chip { display: inline-flex; gap: 5px; align-items: center; font-size: 12px; font-weight: 560; padding: 2px 9px 2px 7px; border-radius: 999px; border: 1px solid var(--ring); color: var(--ink); }
@@ -563,50 +631,210 @@ td.why { white-space: normal; color: var(--muted); }
 .chip.pending span { color: var(--warning); } .chip.failed span { color: var(--critical); }
 .chip.skipped, .chip.unfilled { color: var(--ink-2); }
 footer { color: var(--muted); font-size: 12px; text-align: center; }
+footer a { color: var(--muted); }
 
-@media (max-width: 760px) {
-  .hero, .two { grid-template-columns: 1fr; }
-  .facts { grid-template-columns: repeat(2, 1fr); }
-  .meter-row { grid-template-columns: 8rem 1fr 2.5rem; }
-  .hero-value { font-size: 44px; }
+@media (max-width: 640px) {
+  .card { padding: 16px; }
+  .stats { width: 100%; } .stats div { flex: 1; min-width: 0; padding: 8px 10px; } .stats dd { font-size: 20px; }
+  .race { height: 200px; }
+  .now-price, .countdown { font-size: 21px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live, .dot.pending, .dot-now, .head-dot::after { animation: none; }
 }
 `;
 
 /**
- * Countdown to the next decision (FIVEMIN_DECIDE_AT seconds before each 5-minute close)
- * and the bankroll chart's crosshair. Labels go in with textContent, never innerHTML.
+ * Everything here is optional to the page:
+ *
+ *  - the live window: polls Binance's public 1-second candles for the open window and
+ *    draws them against the window's open — the price to beat;
+ *  - the clock, and what the bot did in this window and the one before;
+ *  - tooltips on the day grid and the bankroll chart;
+ *  - the refresh: the page is fetched again every 30 seconds — and once more just after
+ *    the bot decides — and its `data-live` regions are swapped in place.
+ *
+ * Text only ever goes in with textContent. String.raw, and no template literals inside,
+ * so nothing here is interpolated by the server.
  */
-const SCRIPT = `
+const SCRIPT = String.raw`
 (() => {
-  const el = document.getElementById("countdown");
-  const lead = Number(el?.dataset.decideAt || 15) * 1000;
-  const tick = () => {
-    const now = Date.now(), win = 300000;
-    let next = Math.ceil(now / win) * win - lead;
-    if (next <= now) next += win;
-    const s = Math.round((next - now) / 1000);
-    el.textContent = s <= 1 ? "decidindo…" : Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
-  };
-  if (el) { tick(); setInterval(tick, 1000); }
+  const WIN = 300000, API = "https://data-api.binance.vision/api/v3/klines";
+  const byId = (id) => document.getElementById(id);
+  const mmss = (s) => Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+  const usd = (v, d) => "$" + v.toLocaleString("pt-BR", { minimumFractionDigits: d, maximumFractionDigits: d });
+  const num = (v) => Math.round(v).toLocaleString("pt-BR");
+  const signed = (v) => (v >= 0 ? "+" : "−") + num(Math.abs(v));
+  const pct = (p) => p >= 0.995 ? ">99%" : Math.round(p * 100) + "%";
+  const card = byId("now");
+  const decideAt = card ? Number(card.dataset.decideAt || 15) : 15;
 
-  document.querySelectorAll("figure[data-points]").forEach((fig) => {
+  /* ── Live window ── */
+  let win = 0, open = null, pts = [], span = 0, busy = false, digits = 2;
+  const svg = card && card.querySelector("svg");
+  const fetchJson = async (url) => { const r = await fetch(url, { cache: "no-store" }); if (!r.ok) throw new Error(String(r.status)); return r.json(); };
+
+  const poll = async () => {
+    if (!card || busy || document.hidden) return;
+    busy = true;
+    try {
+      const sym = card.dataset.symbol, w = Math.floor(Date.now() / WIN) * WIN;
+      if (w !== win) { win = w; open = null; pts = []; span = 0; }
+      if (open === null) {
+        const c = await fetchJson(API + "?symbol=" + sym + "&interval=5m&limit=1");
+        if (c[0] && c[0][0] === win) open = Number(c[0][1]);
+      }
+      // The last candle is still forming, so it is fetched again each time.
+      const since = pts.length ? pts[pts.length - 1][0] : win;
+      const rows = await fetchJson(API + "?symbol=" + sym + "&interval=1s&limit=1000&startTime=" + since);
+      pts = pts.filter((p) => p[0] < since);
+      for (const r of rows) if (r[0] >= win && r[0] < win + WIN) pts.push([r[0], Number(r[4])]);
+      if (open === null && pts.length) open = Number(rows[0][1]);
+      draw();
+    } catch (e) {
+      if (!pts.length) { const m = byId("race-msg"); m.hidden = false; m.textContent = "Sem dados da Binance agora."; }
+    } finally { busy = false; }
+  };
+
+  const draw = () => {
+    if (!svg || open === null || !pts.length) return;
+    byId("race-msg").hidden = true;
+    const box = svg.getBoundingClientRect(), VW = 760, VH = 240, R = 0.97;
+    digits = open < 10 ? 3 : 2;
+    for (const p of pts) span = Math.max(span, Math.abs(p[1] - open));
+    const s = Math.max(span * 1.3, open * 0.00012);
+    const x = (t) => ((t - win) / WIN) * VW * R;
+    const y = (v) => VH / 2 - ((v - open) / s) * (VH / 2);
+    let d = "";
+    pts.forEach((p, i) => { d += (i ? "L" : "M") + x(p[0] + 500).toFixed(1) + "," + y(p[1]).toFixed(1); });
+    svg.querySelector(".price").setAttribute("d", d);
+    const act = svg.querySelector(".zone-act");
+    act.setAttribute("x", x(win + WIN - decideAt * 1000));
+    act.setAttribute("width", VW - x(win + WIN - decideAt * 1000));
+    card.querySelector(".tag-act").style.width = ((VW - x(win + WIN - decideAt * 1000)) / VW) * 100 + "%";
+
+    const last = pts[pts.length - 1], gap = last[1] - open, up = gap >= 0;
+    const dot = card.querySelector(".head-dot");
+    dot.style.display = "block";
+    dot.className = "head-dot " + (up ? "up" : "down");
+    dot.style.left = (x(last[0] + 500) / VW) * box.width + "px";
+    dot.style.top = (y(last[1]) / VH) * box.height + "px";
+    byId("beat-label").textContent = "abertura " + usd(open, digits);
+    byId("beat-label").style.top = box.height / 2 + "px";
+    byId("now-price").textContent = usd(last[1], digits);
+    const g = byId("now-gap");
+    g.textContent = (up ? "↑ +" : "↓ −") + usd(Math.abs(gap), digits).slice(1);
+    g.className = "gap " + (up ? "up" : "down");
+  };
+
+  /* ── What the bot did ── */
+  const status = () => {
+    if (!card) return;
+    let rounds = [];
+    try { rounds = JSON.parse(card.dataset.rounds || "[]"); } catch {}
+    const w = Math.floor(Date.now() / WIN) * WIN, left = w + WIN - Date.now();
+    const cur = rounds.find((r) => r.c === w + WIN), prev = rounds.find((r) => r.c === w);
+    const side = (r) => r.side === "down" ? "↓ Desce" : "↑ Sobe";
+    const el = byId("now-status");
+    if (cur && (cur.s === "pending" || cur.s === "won" || cur.s === "lost")) {
+      el.textContent = "Apostou " + num(cur.cost) + " OOM em " + side(cur) + (cur.prob !== null ? " · chance " + pct(cur.prob) : "");
+    } else if (cur) {
+      el.textContent = "Pulou esta: " + cur.why.toLowerCase();
+    } else if (left <= decideAt * 1000) {
+      el.textContent = "Decidindo…";
+    } else {
+      el.textContent = "O robô aposta nos últimos " + decideAt + "s, no lado em que o preço estiver.";
+    }
+    const p = byId("now-prev");
+    p.textContent = !prev ? ""
+      : prev.s === "won" ? "Anterior: ✓ ganhou " + signed(prev.pnl || 0)
+      : prev.s === "lost" ? "Anterior: ✕ perdeu " + num(Math.abs(prev.pnl ?? prev.cost))
+      : prev.s === "pending" ? "Anterior: ◷ " + num(prev.cost) + " em " + side(prev) + ", aguardando"
+      : "Anterior: pulou";
+  };
+
+  /* ── Clock ── */
+  let nudged = 0;
+  const tick = () => {
+    const el = byId("countdown");
+    const into = Date.now() % WIN, left = WIN - into, lead = decideAt * 1000, decided = left <= lead;
+    if (el) {
+      byId("countdown-label").textContent = decided ? "Fecha em" : "Decide em";
+      el.textContent = mmss(Math.ceil((decided ? left : left - lead) / 1000));
+    }
+    document.documentElement.classList.toggle("deciding", decided);
+    // Fetch the page again a few seconds after the bot decides, to show what it did.
+    const w = Date.now() - into;
+    if (left < lead - 6000 && nudged !== w) { nudged = w; refresh(); }
+    status();
+  };
+
+  /* ── Tooltips ── */
+  document.addEventListener("pointermove", (e) => {
+    const t = e.target instanceof Element ? e.target : null;
+    const cell = t && t.closest(".grid24 [data-a]");
+    document.querySelectorAll(".grid24 .tooltip").forEach((tip) => {
+      if (!cell) { tip.hidden = true; return; }
+      const fig = tip.parentElement, b = fig.getBoundingClientRect(), c = cell.getBoundingClientRect();
+      tip.children[0].textContent = cell.getAttribute("data-a");
+      tip.children[1].textContent = cell.getAttribute("data-b");
+      tip.style.left = Math.min(Math.max(c.left + c.width / 2 - b.left, 110), b.width - 110) + "px";
+      tip.style.top = c.top - b.top + 4 + "px";
+      tip.hidden = false;
+    });
+
+    const hit = t && t.closest(".chart-hit");
+    const fig = hit ? hit.closest("figure[data-points]") : null;
+    document.querySelectorAll("figure.chart.hovering").forEach((f) => {
+      if (f !== fig) { f.classList.remove("hovering"); f.querySelector(".tooltip").hidden = true; }
+    });
+    if (!fig) return;
     const pts = JSON.parse(fig.dataset.points);
-    const svg = fig.querySelector("svg"), hit = fig.querySelector(".hit");
-    const cross = fig.querySelector(".cross"), dot = fig.querySelector(".hover-dot");
-    const tip = fig.querySelector(".tooltip"), [val, lab] = tip.children;
-    const move = (e) => {
-      const box = svg.getBoundingClientRect(), scale = svg.viewBox.baseVal.width / box.width;
-      const x = (e.clientX - box.left) * scale;
-      let best = pts[0];
-      for (const p of pts) if (Math.abs(p.x - x) < Math.abs(best.x - x)) best = p;
-      cross.setAttribute("x1", best.x); cross.setAttribute("x2", best.x);
-      dot.setAttribute("cx", best.x); dot.setAttribute("cy", best.y);
-      val.textContent = best.v + " OOM"; lab.textContent = best.t;
-      tip.style.left = (best.x / scale) + "px"; tip.style.top = (best.y / scale) + "px";
-      tip.hidden = false; fig.classList.add("hovering");
-    };
-    hit.addEventListener("pointermove", move);
-    hit.addEventListener("pointerleave", () => { tip.hidden = true; fig.classList.remove("hovering"); });
+    const s = fig.querySelector("svg"), box = s.getBoundingClientRect(), scale = s.viewBox.baseVal.width / box.width;
+    const x = (e.clientX - box.left) * scale;
+    let best = pts[0];
+    for (const p of pts) if (Math.abs(p.x - x) < Math.abs(best.x - x)) best = p;
+    const cross = fig.querySelector(".cross"), dot = fig.querySelector(".hover-dot"), tip = fig.querySelector(".tooltip");
+    cross.setAttribute("x1", best.x); cross.setAttribute("x2", best.x);
+    dot.setAttribute("cx", best.x); dot.setAttribute("cy", best.y);
+    tip.children[0].textContent = best.v + " OOM";
+    tip.children[1].textContent = best.t;
+    tip.style.left = best.x / scale + "px";
+    tip.style.top = best.y / scale + "px";
+    tip.hidden = false;
+    fig.classList.add("hovering");
+  });
+
+  /* ── Refresh in place ── */
+  let fetched = Date.now();
+  async function refresh() {
+    if (document.hidden) return;
+    try {
+      const res = await fetch(location.href, { cache: "no-store" });
+      if (!res.ok) return;
+      const doc = new DOMParser().parseFromString(await res.text(), "text/html");
+      document.querySelectorAll("[data-live]").forEach((el) => {
+        const next = doc.getElementById(el.id);
+        if (next) el.replaceChildren(...Array.from(next.childNodes));
+      });
+      const next = doc.getElementById("now");
+      if (next && card) card.dataset.rounds = next.dataset.rounds;
+      document.title = doc.title;
+      fetched = Date.now();
+      status();
+    } catch {}
+  }
+
+  tick();
+  setInterval(tick, 1000);
+  poll();
+  setInterval(poll, 1000);
+  setInterval(refresh, 30000);
+  addEventListener("resize", draw);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    poll();
+    if (Date.now() - fetched > 30000) refresh();
   });
 })();
 `;
