@@ -3,7 +3,7 @@ import type { CreateOrderBody, Currency, FuturEvent, Position } from "futuur";
 import { enabledAssets } from "./assets.js";
 import type { Asset } from "./assets.js";
 import { listSides, parsePriceToBeat, sdk, walletBalance } from "./bet.js";
-import { fairValue, realisedVolatility } from "./edge.js";
+import { fairValue, shortVolatility } from "./edge.js";
 import {
   listPendingRounds,
   loadLedger,
@@ -12,9 +12,9 @@ import {
   reserve,
   updateRound,
 } from "./rounds.js";
-import type { RoundRecord } from "./rounds.js";
+import type { Ledger, RoundRecord } from "./rounds.js";
 import { marketIdOf, profitOf, toWagers } from "./settle.js";
-import { planOrder } from "./plan.js";
+import { allocate, planOrder } from "./plan.js";
 import type { Plan } from "./plan.js";
 
 /**
@@ -62,9 +62,9 @@ const config = () => ({
   minProb: num("FIVEMIN_MIN_PROB", 0.7),
   /** Share of the bankroll one round may stake. 1 = all-in allowed. */
   maxFraction: num("FIVEMIN_MAX_FRACTION", 1),
-  /** Multiplier on the Kelly stake. 1 = full Kelly. */
-  kelly: num("FIVEMIN_KELLY", 1),
-  /** Inflates realised volatility: crypto's tails over 10s are fatter than a walk's. */
+  /** Multiplier on the Kelly stake. 1 = full Kelly; 0.5 = half, the usual hedge against a mis-estimated probability. */
+  kelly: num("FIVEMIN_KELLY", 0.5),
+  /** Inflates realised volatility: crypto's tails over 10s are fatter than a walk's. Calibrate with scripts/backtest-5min.mjs. */
   volMult: num("FIVEMIN_VOL_MULT", 1.5),
   /** Smallest stake worth placing. */
   minStake: num("FIVEMIN_MIN_STAKE", 10),
@@ -73,25 +73,69 @@ const config = () => ({
 
 type Config = ReturnType<typeof config>;
 
+/**
+ * How long before the decision to fetch volatility and touch both books. Besides the
+ * numbers, it opens the TLS connections to Binance and Futuur, so the reads after the
+ * wake ride warm sockets instead of paying for handshakes in the last seconds.
+ */
+const WARM_LEAD_MS = 3_000;
+
+type Settled = { closesAt: string; status: string; pnl: number }[];
+
+/** Everything about an asset's round that can be known before the last seconds. */
+interface Prepared {
+  asset: Asset;
+  settled: Settled;
+  ledger: Ledger;
+  event: FuturEvent | undefined;
+}
+
+type Ready = Prepared & { event: FuturEvent };
+
 export const handler = async () => {
   const cfg = config();
   const assets = enabledAssets();
 
   // Side by side: the waits overlap, so three assets take no longer than one. Each is
   // isolated — one asset failing must not cost the others their round.
+  const failed = (asset: Asset, error: unknown) => {
+    console.error("asset failed", { asset: asset.key, error });
+    return { settled: [], round: null, error: error instanceof Error ? error.message : String(error) };
+  };
+
+  const prepared = await Promise.all(
+    assets.map((asset) => prepare(asset, cfg).catch((error: unknown) => failed(asset, error))),
+  );
+  const ready = prepared.filter((p): p is Ready => "asset" in p && p.event !== undefined);
+
+  // The wallet is shared and every asset bets at the same instant: split it now, in
+  // proportion to each ledger, so no two assets can stake the same money.
+  const wallet = ready.length
+    ? await walletBalance(CURRENCY).catch((error: unknown) => {
+        console.error("wallet balance unavailable", error);
+        return null;
+      })
+    : null;
+  const slices = allocate(wallet ?? 0, ready.map((p) => p.ledger.bankroll));
+
   const results = await Promise.all(
-    assets.map((asset) =>
-      play(asset, cfg).catch((error: unknown) => {
-        console.error("asset failed", { asset: asset.key, error });
-        return { settled: [], round: null, error: error instanceof Error ? error.message : String(error) };
-      }),
-    ),
+    prepared.map((p) => {
+      if (!("asset" in p)) return p;
+      const i = ready.indexOf(p as Ready);
+      if (i < 0) {
+        console.warn("no open 5-minute event closing in the next few minutes", { asset: p.asset.key });
+        return finish(p.settled, null);
+      }
+      return play(ready[i]!, { wallet, slice: slices[i]! }, cfg).catch((error: unknown) =>
+        failed(p.asset, error),
+      );
+    }),
   );
   return Object.fromEntries(assets.map((asset, i) => [asset.key, results[i]]));
 };
 
-/** One asset's round: settle what resolved, wait for the last seconds, decide, bet. */
-async function play(asset: Asset, cfg: Config) {
+/** Settle what resolved, then find the event and the bankroll to play it with. */
+async function prepare(asset: Asset, cfg: Config): Promise<Prepared> {
   await loadLedger(asset, cfg.budget);
 
   // Settle first: the previous round resolved about a minute after it closed, and
@@ -100,13 +144,17 @@ async function play(asset: Asset, cfg: Config) {
     console.error("settling failed", { asset: asset.key, error });
     return [];
   });
+  // Read after settling, and final: nothing else touches this ledger until the bet.
+  const [ledger, event] = await Promise.all([loadLedger(asset, cfg.budget), currentEvent(asset)]);
+  return { asset, settled, ledger, event };
+}
 
-  const event = await currentEvent(asset);
-  if (!event) {
-    console.warn("no open 5-minute event closing in the next few minutes", { asset: asset.key });
-    return { settled, round: null };
-  }
-
+/** One asset's round: wait for the last seconds, decide, bet. */
+async function play(
+  { asset, settled, ledger, event }: Ready,
+  funds: { wallet: number | null; slice: number },
+  cfg: Config,
+) {
   const skip = (
     base: Pick<RoundRecord, "eventId" | "title" | "closesAt" | "dryRun">,
     reason: string,
@@ -120,9 +168,24 @@ async function play(asset: Asset, cfg: Config) {
   let placed: { orderId: number; orderStatus: string; side: "up" | "down" } | undefined;
 
   try {
-    // Everything that does not need to be fresh is read before the wait.
-    const vol = await realisedVolatility(asset.symbol).catch(() => null);
-    const side = (direction: "up" | "down") => sideOf(event, direction);
+    const sides = { up: sideOf(event, "up"), down: sideOf(event, "down") };
+    const bookOf = (direction: "up" | "down") =>
+      sdk.getOrderBook(sides[direction].market.id, {
+        currency_mode: CURRENCY_MODE,
+        position: sides[direction].position,
+      });
+
+    // Warm-up, a few seconds before deciding: volatility from the freshest seconds,
+    // and a throwaway read of both books to open the connection to Futuur.
+    await sleepUntil(close - cfg.decideAt * 1000 - WARM_LEAD_MS);
+    const [vol] = await Promise.all([
+      shortVolatility(asset.symbol, { timeoutMs: 2_500 }).catch((error: unknown) => {
+        console.error("volatility unavailable", { asset: asset.key, error });
+        return null;
+      }),
+      bookOf("up").catch(() => null),
+      bookOf("down").catch(() => null),
+    ]);
 
     await sleepUntil(close - cfg.decideAt * 1000);
 
@@ -132,21 +195,21 @@ async function play(asset: Asset, cfg: Config) {
       return finish(settled, await skip(base, `woke up too late, ${secondsLeft.toFixed(1)}s left`));
     }
 
-    const [candle, wallet, current] = await Promise.all([
+    // One round trip for everything fresh: the candle and both books, so the side
+    // that spot picks already has its book in hand.
+    const [candle, upBook, downBook] = await Promise.all([
       binanceCandle(asset.symbol),
-      walletBalance(CURRENCY).catch((error: unknown) => {
-        console.error("wallet balance unavailable", error);
-        return null;
-      }),
-      loadLedger(asset, cfg.budget),
+      bookOf("up"),
+      bookOf("down"),
     ]);
+    const readMs = Date.now() - now;
 
     const priceToBeat = lineOf(event);
     const spot = candle.close;
     const gap = round2(spot - priceToBeat);
 
     if (vol === null) {
-      return finish(settled, await skip(base, "no volatility estimate", { priceToBeat, spot, gap }));
+      return finish(settled, await skip(base, "no volatility estimate", { priceToBeat, spot, gap, readMs }));
     }
     const sigma = Math.max(vol.sigma * cfg.volMult, 1e-6);
     const value = fairValue(spot, priceToBeat, secondsLeft, { sigma, samples: vol.samples });
@@ -154,11 +217,13 @@ async function play(asset: Asset, cfg: Config) {
     // Futuur resolves Up on close >= open, so a tie belongs to Up.
     const direction = spot >= priceToBeat ? "up" : "down";
     const prob = value.fair[direction];
-    const chosen = side(direction);
+    const chosen = sides[direction];
+    const book = direction === "up" ? upBook : downBook;
 
     const facts = {
       decidedAt: new Date(now).toISOString(),
       secondsLeft: round2(secondsLeft),
+      readMs,
       priceToBeat,
       binanceOpen: candle.open,
       spot,
@@ -168,8 +233,9 @@ async function play(asset: Asset, cfg: Config) {
       probUp: value.fair.up,
       side: direction,
       prob,
-      bankrollBefore: current.bankroll,
-      wallet: wallet ?? undefined,
+      bankrollBefore: ledger.bankroll,
+      wallet: funds.wallet ?? undefined,
+      walletShare: funds.slice,
     } as const;
 
     // The line check: Futuur settles on the Binance 5m candle, so its price to beat
@@ -184,22 +250,20 @@ async function play(asset: Asset, cfg: Config) {
       return finish(settled, await skip(base, `${direction} only ${pct(prob)} — too close to call`, facts));
     }
 
-    const bankroll = Math.min(current.bankroll, wallet ?? 0) * cfg.maxFraction;
+    // The slice is already at most this ledger's bankroll (src/plan.ts allocate).
+    const bankroll = Math.min(ledger.bankroll, funds.slice) * cfg.maxFraction;
     if (bankroll < cfg.minStake) {
       return finish(
         settled,
         await skip(
           base,
-          `nothing to stake: bankroll ${current.bankroll}, wallet ${wallet ?? "unavailable"}`,
+          `nothing to stake: bankroll ${ledger.bankroll}, wallet ${funds.wallet ?? "unavailable"}, ` +
+            `share ${funds.slice}`,
           facts,
         ),
       );
     }
 
-    const book = await sdk.getOrderBook(chosen.market.id, {
-      currency_mode: CURRENCY_MODE,
-      position: chosen.position,
-    });
     const plan = planOrder(book.ask ?? [], prob, bankroll, cfg);
     const priced = { ...facts, bestAsk: book.ask?.[0]?.price ?? null, maxPrice: plan.maxPrice };
 
@@ -224,7 +288,13 @@ async function play(asset: Asset, cfg: Config) {
       return finish(settled, await skip(base, `dry run, would bet: ${why}`, { ...priced, ...planned(plan) }));
     }
 
+    const sentAt = Date.now();
+    const timing = {
+      orderSentAt: new Date(sentAt).toISOString(),
+      secondsLeftAtOrder: round2((close - sentAt) / 1000),
+    };
     const order = await placeOrder(event, chosen.market.id, chosen.position, plan);
+    const timed = { ...timing, orderMs: Date.now() - sentAt };
     placed = { orderId: order.id, orderStatus: order.status, side: direction };
     const sharesFilled = Number(order.shares_filled ?? (order.status === "filled" ? plan.shares : 0));
 
@@ -234,6 +304,7 @@ async function play(asset: Asset, cfg: Config) {
         await skip(base, `order canceled by Futuur, nothing charged — ${why}`, {
           ...priced,
           ...planned(plan),
+          ...timed,
           orderId: order.id,
           orderStatus: order.status,
         }),
@@ -247,6 +318,7 @@ async function play(asset: Asset, cfg: Config) {
       ...base,
       ...priced,
       ...planned(plan),
+      ...timed,
       status: "pending",
       reason: why,
       orderId: order.id,
@@ -355,11 +427,9 @@ async function placeOrder(event: FuturEvent, market: number, position: Position,
  * Settles every pending round whose market has resolved. The P&L is Futuur's own
  * number off the wager, so the ledger tracks what was really paid and paid out.
  */
-async function settlePending(
-  asset: Asset,
-): Promise<{ closesAt: string; status: string; pnl: number }[]> {
+async function settlePending(asset: Asset): Promise<Settled> {
   const pending = await listPendingRounds(asset);
-  const out: { closesAt: string; status: string; pnl: number }[] = [];
+  const out: Settled = [];
 
   for (const round of pending) {
     // Resolution lands about a minute after the close.

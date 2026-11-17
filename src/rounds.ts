@@ -4,6 +4,7 @@ import {
   GetCommand,
   PutCommand,
   QueryCommand,
+  TransactWriteCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { Resource } from "sst";
@@ -18,11 +19,16 @@ import type { Asset } from "./assets.js";
  *   pk `ROUND5#ETH`  sk `<betEndDate>`  — the same for Ethereum (`#SOL` for Solana)
  *   pk `FIVEMIN`     sk `STATE`         — Bitcoin's bankroll ledger
  *   pk `FIVEMIN`     sk `STATE#ETH`     — Ethereum's (`STATE#SOL` for Solana)
+ *   pk `PENDING#<rounds pk>` sk `<betEndDate>` — a copy of each round still pending,
+ *                                       so settling reads only those instead of days
+ *                                       of rounds. Written and removed in the same
+ *                                       transaction as the round's status change.
  *
  * Every round is written, including the ones it skipped and why, so the whole run
  * can be audited afterwards: what it saw, what it decided, what it paid, what came back.
  */
 const ledgerKey = (asset: Asset) => ({ pk: "FIVEMIN", sk: asset.ledgerSk });
+const pendingPk = (asset: Asset) => `PENDING#${asset.roundPk}`;
 
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -82,10 +88,20 @@ export interface RoundRecord {
   cost?: number;
   bankrollBefore?: number;
   wallet?: number;
+  /** This asset's slice of the shared wallet (src/plan.ts allocate). */
+  walletShare?: number;
 
   orderId?: number;
   orderStatus?: string;
   sharesFilled?: number;
+
+  /** How long the post-wake reads (candle, books) took, in ms. */
+  readMs?: number;
+  /** When the order request went out, and how close to the close that was. */
+  orderSentAt?: string;
+  secondsLeftAtOrder?: number;
+  /** Round trip of the order request(s), in ms. */
+  orderMs?: number;
 
   /** Filled in when the round settles. */
   resolution?: string | null;
@@ -203,7 +219,18 @@ export async function putRound(
   round: Omit<RoundRecord, "pk" | "sk" | "asset">,
 ): Promise<RoundRecord> {
   const record: RoundRecord = { ...round, pk: asset.roundPk, sk: round.closesAt, asset: asset.key };
-  await client.send(new PutCommand({ TableName: table(), Item: record }));
+  if (record.status !== "pending") {
+    await client.send(new PutCommand({ TableName: table(), Item: record }));
+    return record;
+  }
+  await client.send(
+    new TransactWriteCommand({
+      TransactItems: [
+        { Put: { TableName: table(), Item: record } },
+        { Put: { TableName: table(), Item: { ...record, pk: pendingPk(asset) } } },
+      ],
+    }),
+  );
   return record;
 }
 
@@ -215,13 +242,25 @@ export async function updateRound(
   const entries = Object.entries(fields).filter(([, value]) => value !== undefined);
   if (entries.length === 0) return;
 
+  const update = {
+    TableName: table(),
+    Key: { pk: asset.roundPk, sk },
+    UpdateExpression: `SET ${entries.map((_, i) => `#k${i} = :v${i}`).join(", ")}`,
+    ExpressionAttributeNames: Object.fromEntries(entries.map(([key], i) => [`#k${i}`, key])),
+    ExpressionAttributeValues: Object.fromEntries(entries.map(([, value], i) => [`:v${i}`, value])),
+  };
+
+  // Leaving "pending" clears the marker in the same write, so the two never disagree.
+  if (fields.status === undefined || fields.status === "pending") {
+    await client.send(new UpdateCommand(update));
+    return;
+  }
   await client.send(
-    new UpdateCommand({
-      TableName: table(),
-      Key: { pk: asset.roundPk, sk },
-      UpdateExpression: `SET ${entries.map((_, i) => `#k${i} = :v${i}`).join(", ")}`,
-      ExpressionAttributeNames: Object.fromEntries(entries.map(([key], i) => [`#k${i}`, key])),
-      ExpressionAttributeValues: Object.fromEntries(entries.map(([, value], i) => [`:v${i}`, value])),
+    new TransactWriteCommand({
+      TransactItems: [
+        { Update: update },
+        { Delete: { TableName: table(), Key: { pk: pendingPk(asset), sk } } },
+      ],
     }),
   );
 }
@@ -240,19 +279,37 @@ export async function listRounds(asset: Asset, limit = 100): Promise<RoundRecord
   return (result.Items ?? []) as RoundRecord[];
 }
 
-/** Rounds still waiting on a result, bounded to the last two days. */
+/**
+ * Rounds still waiting on a result: the pending markers, plus the last half hour of
+ * rounds filtered on status, which covers any round written before markers existed.
+ */
 export async function listPendingRounds(asset: Asset): Promise<RoundRecord[]> {
-  const since = new Date(Date.now() - 2 * 86_400_000).toISOString();
-  const result = await client.send(
-    new QueryCommand({
-      TableName: table(),
-      KeyConditionExpression: "pk = :pk AND sk >= :since",
-      FilterExpression: "#status = :pending",
-      ExpressionAttributeNames: { "#status": "status" },
-      ExpressionAttributeValues: { ":pk": asset.roundPk, ":since": since, ":pending": "pending" },
-    }),
-  );
-  return (result.Items ?? []) as RoundRecord[];
+  const since = new Date(Date.now() - 30 * 60_000).toISOString();
+  const [markers, recent] = await Promise.all([
+    client.send(
+      new QueryCommand({
+        TableName: table(),
+        KeyConditionExpression: "pk = :pk",
+        ExpressionAttributeValues: { ":pk": pendingPk(asset) },
+      }),
+    ),
+    client.send(
+      new QueryCommand({
+        TableName: table(),
+        KeyConditionExpression: "pk = :pk AND sk >= :since",
+        FilterExpression: "#status = :pending",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: { ":pk": asset.roundPk, ":since": since, ":pending": "pending" },
+      }),
+    ),
+  ]);
+
+  const bySk = new Map<string, RoundRecord>();
+  for (const item of [...(markers.Items ?? []), ...(recent.Items ?? [])]) {
+    const round = { ...(item as RoundRecord), pk: asset.roundPk };
+    bySk.set(round.sk, round);
+  }
+  return [...bySk.values()].sort((a, b) => a.sk.localeCompare(b.sk));
 }
 
 function round2(value: number): number {

@@ -44,21 +44,38 @@ const BINANCE_KLINES = "https://api.binance.com/api/v3/klines";
 
 /**
  * Realised per-second volatility of log returns from the last hour of one-minute closes
- * of a Binance pair.
+ * of a Binance pair. The hourly agent's horizon is minutes, so minutes are its sample.
  */
 export async function realisedVolatility(
   symbol = "BTCUSDT",
 ): Promise<{ sigma: number; samples: number }> {
-  const response = await fetch(`${BINANCE_KLINES}?symbol=${symbol}&interval=1m&limit=60`, {
-    signal: AbortSignal.timeout(5_000),
-  });
-  if (!response.ok) throw new Error(`klines HTTP ${response.status}`);
+  return volatilityFromCloses(await binanceCloses(symbol, "1m", 60, 5_000), 60);
+}
 
-  const rows = (await response.json()) as unknown[];
-  const closes = rows
-    .map((row) => Number((row as unknown[])[4]))
-    .filter((close) => Number.isFinite(close) && close > 0);
+/**
+ * Per-second volatility for a horizon of seconds: the last 15 minutes of one-second
+ * closes, sampled every 5 seconds. One-second returns would be dominated by trades
+ * bouncing between bid and ask, which inflates the estimate; five seconds is long
+ * enough to wash that out and still about the horizon the 5-minute bot bets over.
+ */
+export async function shortVolatility(
+  symbol: string,
+  { seconds = 900, step = 5, timeoutMs = 3_000 } = {},
+): Promise<{ sigma: number; samples: number }> {
+  const closes = await binanceCloses(symbol, "1s", Math.min(seconds, 1000), timeoutMs);
+  // Keep the newest close and every `step`-th before it, so every return spans `step` seconds.
+  const sampled = closes.filter((_, i) => (closes.length - 1 - i) % step === 0);
+  return volatilityFromCloses(sampled, step);
+}
 
+/**
+ * Per-second stdev of log returns between closes `secondsApart` apart. Variance is
+ * linear in time under a walk, so it scales down by the spacing.
+ */
+export function volatilityFromCloses(
+  closes: number[],
+  secondsApart: number,
+): { sigma: number; samples: number } {
   if (closes.length < 10) throw new Error(`only ${closes.length} usable candles`);
 
   const returns = closes.slice(1).map((close, i) => Math.log(close / closes[i]!));
@@ -66,8 +83,24 @@ export async function realisedVolatility(
   const variance =
     returns.reduce((sum, r) => sum + (r - mean) ** 2, 0) / (returns.length - 1);
 
-  // Per-minute stdev scaled to per-second: variance is linear in time under a walk.
-  return { sigma: Math.sqrt(variance / 60), samples: returns.length };
+  return { sigma: Math.sqrt(variance / secondsApart), samples: returns.length };
+}
+
+async function binanceCloses(
+  symbol: string,
+  interval: "1s" | "1m",
+  limit: number,
+  timeoutMs: number,
+): Promise<number[]> {
+  const response = await fetch(`${BINANCE_KLINES}?symbol=${symbol}&interval=${interval}&limit=${limit}`, {
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) throw new Error(`klines HTTP ${response.status}`);
+
+  const rows = (await response.json()) as unknown[];
+  return rows
+    .map((row) => Number((row as unknown[])[4]))
+    .filter((close) => Number.isFinite(close) && close > 0);
 }
 
 export function fairValue(

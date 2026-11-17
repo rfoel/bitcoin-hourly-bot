@@ -15,7 +15,7 @@ export interface Plan {
  * — so it goes all-in only when that is what the edge justifies.
  */
 export function planOrder(
-  asks: OrderBookLevel[],
+  asks: Pick<OrderBookLevel, "price" | "total_shares">[],
   prob: number,
   bankroll: number,
   cfg: { minEdge: number; kelly: number },
@@ -52,6 +52,20 @@ export function planOrder(
     maxPrice,
     levels,
   };
+}
+
+/**
+ * The wallet is shared by every asset, and they all bet at the same instant, so each
+ * gets a slice of it in proportion to its own bankroll. When the wallet covers every
+ * bankroll the slices are the bankrolls themselves; when it does not, no two assets
+ * can count the same money.
+ */
+export function allocate(wallet: number, bankrolls: number[]): number[] {
+  const positive = bankrolls.map((b) => Math.max(0, b));
+  const total = positive.reduce((sum, b) => sum + b, 0);
+  if (total <= 0 || wallet <= 0) return positive.map(() => 0);
+  const scale = Math.min(1, wallet / total);
+  return positive.map((b) => Math.floor(b * scale * 100) / 100);
 }
 
 function round2(value: number): number {

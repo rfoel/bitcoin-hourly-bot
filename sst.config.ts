@@ -23,9 +23,16 @@ export default $config({
     // DNS record. Set it with `sst secret set Domain <host> --stage <stage>`.
     const domain = new sst.Secret("Domain");
 
-    const betting = {
+    const futuur = {
       FUTUUR_PUBLIC_KEY: publicKey.value,
       FUTUUR_PRIVATE_KEY: privateKey.value,
+      FUTUUR_CURRENCY: "OOM",
+    };
+
+    // The hourly bot's settings. Only the API's on-demand POST /bet still reads them;
+    // the 5-minute bot has its own FIVEMIN_* settings below.
+    const betting = {
+      ...futuur,
       // https://futuur.com/markets/bitcoin-hourly is category 3702. Hourly events
       // carry no tags, so the category is the only exact handle on them — and it
       // keeps category 3689 (bitcoin-daily) out, which otherwise collides at 15:59.
@@ -35,7 +42,6 @@ export default $config({
       FUTUUR_SEARCH: "bitcoin",
       FUTUUR_TITLE_MATCH: "bitcoin|btc",
       FUTUUR_WINDOW_MINUTES: "70",
-      FUTUUR_CURRENCY: "OOM",
       // Stake is this fraction of the wallet, so it grows with winnings and
       // shrinks after losses on its own. HARD_CAP in src/bet.ts is the ceiling
       // FUTUUR_MAX_STAKE cannot exceed.
@@ -96,7 +102,7 @@ export default $config({
       function: {
         handler: "src/fivemin.handler",
         environment: {
-          ...betting,
+          ...futuur,
           FIVEMIN_ASSETS: fiveMinAssets,
           // Starting bankroll of each asset. Read only when that asset's ledger
           // (pk FIVEMIN, sk STATE / STATE#ETH / STATE#SOL) is created on its first
@@ -109,11 +115,15 @@ export default $config({
           // only when the favoured side is at least 70% likely.
           FIVEMIN_MIN_EDGE: "0.05",
           FIVEMIN_MIN_PROB: "0.7",
-          // All-in allowed: one round may stake the whole bankroll. Kelly decides how
-          // much of it — ~all of it near certainty, about half at 80%.
+          // All-in allowed: one round may stake the whole bankroll. Half Kelly decides
+          // how much of it — about half near certainty, under a third at 80%. Full Kelly on
+          // a probability that is itself an estimate overbets whenever the model is
+          // optimistic; half gives up a little growth for much less variance.
           FIVEMIN_MAX_FRACTION: "1",
-          FIVEMIN_KELLY: "1",
-          // Crypto's 15-second tails are fatter than a random walk's.
+          FIVEMIN_KELLY: "0.5",
+          // Crypto's 15-second tails are fatter than a random walk's. Volatility now
+          // comes from 5-second returns over the last 15 minutes (src/edge.ts
+          // shortVolatility); re-check this against scripts/backtest-5min.mjs.
           FIVEMIN_VOL_MULT: "1.5",
           FIVEMIN_MIN_STAKE: "10",
           FIVEMIN_DRY_RUN: "false",

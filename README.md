@@ -16,19 +16,28 @@ more — see [The hourly agent](#the-hourly-agent) below.
 minute before the close. Each run:
 
 1. **Settles** every pending round that has resolved, with Futuur's own P&L off the wager,
-   and credits it back to the ledger.
-2. **Finds** the open event in the asset's category closing within the window.
-3. **Sleeps** until `FIVEMIN_DECIDE_AT` (15) seconds before the close.
-4. **Reads** the pair's Binance 5m candle in progress — the exact candle Futuur settles
-   on. Its open must equal the event's price to beat (the line check, within 0.0015% of
-   the price), and its latest close is where the market would settle right now.
+   and credits it back to the ledger. Pending rounds are found through a marker item
+   per round (`pk PENDING#<rounds pk>`), not by filtering days of rounds.
+2. **Finds** the open event in the asset's category closing within the window, and
+   **splits the wallet** between the assets in proportion to their ledgers.
+3. **Warms up** 3 seconds before deciding: fetches volatility and touches both books,
+   which also opens the TLS connections to Binance and Futuur.
+4. **Reads**, at `FIVEMIN_DECIDE_AT` (15) seconds before the close and in one round
+   trip, the pair's Binance 5m candle in progress — the exact candle Futuur settles
+   on — and the book of both sides. The candle's open must equal the event's price to
+   beat (the line check, within 0.0015% of the price), and its latest close is where
+   the market would settle right now.
 5. **Decides**: the side spot is on, with a probability from a driftless walk over the
-   seconds left (`src/edge.ts`, volatility from the last hour × `FIVEMIN_VOL_MULT`).
-   Below `FIVEMIN_MIN_PROB` it skips.
+   seconds left (`src/edge.ts`, volatility from 5-second returns over the last 15
+   minutes × `FIVEMIN_VOL_MULT`). Below `FIVEMIN_MIN_PROB` it skips.
 6. **Sizes** by walking the ask ladder (`src/plan.ts`): only levels at least
-   `FIVEMIN_MIN_EDGE` below the probability, capped by Kelly on the running average
-   price. That is roughly all-in near certainty and about half the bankroll at 80%.
-7. **Bets** with one limit order at the deepest level touched, and **records** the round.
+   `FIVEMIN_MIN_EDGE` below the probability, capped by half Kelly on the running
+   average price. That is about half the bankroll near certainty and under a third at
+   80% — in practice the ladder's depth binds long before Kelly does once the bankroll
+   has grown.
+7. **Bets** with one limit order at the deepest level touched, and **records** the round,
+   including `readMs`, `orderMs` and `secondsLeftAtOrder` — the numbers to tune
+   `FIVEMIN_DECIDE_AT` with.
 
 ### Assets
 
@@ -43,8 +52,10 @@ The same product exists for three pairs, and the bot plays all of them (`src/ass
 Their windows close at the same instant, so **one invocation plays them all side by
 side** — the waits overlap, and there is one Lambda run per window instead of three. Each
 asset is isolated: its own ledger, its own rounds, and a failure in one does not cost the
-others their round. They share the Futuur wallet, so a round stakes at most
-`min(its ledger's bankroll, wallet balance)`.
+others their round. They share the Futuur wallet and bet at the same instant, so the
+wallet is split between them in proportion to their ledgers (`allocate` in
+`src/plan.ts`): each round stakes at most `min(its ledger's bankroll, its slice)`, and
+no two assets can count the same money.
 
 `FIVEMIN_ASSETS` (`btc,eth,sol`) picks which ones run. Every other setting below is
 shared by all of them.
@@ -62,7 +73,7 @@ about a minute after the close.
 Each asset keeps its own ledger (`pk FIVEMIN`, `sk STATE` for Bitcoin — see
 [Assets](#assets)), seeded once from `FIVEMIN_BUDGET` = **10,000 OOM**. A bet's cost is held out of the bankroll until it
 settles, then the cost plus Futuur's P&L comes back. A round never stakes more than
-`min(ledger bankroll, wallet balance) × FIVEMIN_MAX_FRACTION` — `1`, so all-in is allowed.
+`min(ledger bankroll, wallet slice) × FIVEMIN_MAX_FRACTION` — `1`, so all-in is allowed.
 
 To start an asset over with a fresh budget, delete its ledger item; the next run
 re-seeds it.
@@ -90,8 +101,19 @@ after.
 | `FIVEMIN_MIN_PROB` | `0.7` | Skip below this probability for the favoured side |
 | `FIVEMIN_MIN_EDGE` | `0.05` | Only buy levels at least this far below the probability |
 | `FIVEMIN_MAX_FRACTION` | `1` | Share of the bankroll one round may stake |
-| `FIVEMIN_KELLY` | `1` | Kelly multiplier; `0.5` is half-Kelly |
+| `FIVEMIN_KELLY` | `0.5` | Kelly multiplier; `1` is full Kelly |
 | `FIVEMIN_VOL_MULT` | `1.5` | Safety factor on realised volatility |
+
+### Calibrating the model
+
+`node scripts/backtest-5min.mjs <btc|eth|sol> [limit]` re-prices every recorded round
+with the old (1h of 1m) and new (15 min of 1s) volatility under several multipliers, and
+checks each against the real 5m close: Brier score, log loss, and predicted vs observed
+win rate per probability bucket. A bucket that wins less often than predicted is where
+the bot overbets.
+
+`pnpm test` runs the unit tests (`test/`, Node's built-in runner) for the order planner,
+the wallet split and the probability model.
 | `FIVEMIN_DRY_RUN` | `false` | Record what it would bet without placing an order |
 
 ## The hourly agent
