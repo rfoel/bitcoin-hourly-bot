@@ -73,10 +73,8 @@ export async function placeBet(overrides: BetOverrides = {}) {
   const sized = await sizeOrder(outcome, currency, stake.amount);
 
   // The API wants `shares`, not `amount` — an amount-only body comes back as
-  // `KeyError: 'shares'`. And `price` is either a real number or absent: sending
-  // `price: null` answers 401, because the SDK drops null params when building
-  // the HMAC while axios still puts `"price": null` on the wire, so the server
-  // signs one parameter more than the client did.
+  // `KeyError: 'shares'`. And `price` is either a real number or absent: a
+  // `price: null` on the wire is a parameter the server signs and the client may not.
   const order: CreateOrderBody = {
     market: outcome.market.id,
     side: "bid",

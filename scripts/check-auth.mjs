@@ -20,8 +20,8 @@ async function attempt(label, run) {
     console.log(`PASS  ${label}`);
     return result;
   } catch (error) {
-    const status = error?.response?.status ?? "?";
-    const code = error?.response?.data?.errors?.[0]?.code ?? error?.message;
+    const status = error?.status ?? "?";
+    const code = error?.code ?? error?.message;
     console.log(`FAIL  ${label}  [${status}] ${code}`);
     return null;
   }

@@ -129,8 +129,8 @@ for (const variant of variants) {
     console.log(`PASS  ${variant.label}  order #${id} — stopping, bet placed`);
     break;
   } catch (error) {
-    const status = error?.response?.status ?? "?";
-    const code = error?.response?.data?.errors?.[0]?.code ?? error?.message;
+    const status = error?.status ?? "?";
+    const code = error?.code ?? error?.message;
     console.log(`FAIL  ${variant.label}  [${status}] ${code}`);
   }
   // The API rejects identical POSTs inside one second.

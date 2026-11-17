@@ -1,5 +1,6 @@
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda";
+import { FutuurError } from "futuur";
 import { assetOf, DEFAULT_ASSET, enabledAssets } from "./assets.js";
 import type { Asset } from "./assets.js";
 import { placeBet, walletBalance } from "./bet.js";
@@ -252,11 +253,10 @@ function str(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-/** Futuur errors are axios errors — the API error code lives in `response.data`. */
+/** A FutuurError carries the API's own error body; pass it through for debugging. */
 function describe(error: unknown): { error: string; detail?: unknown } {
   const message = error instanceof Error ? error.message : String(error);
-  const detail = (error as { response?: { data?: unknown } })?.response?.data;
-  return detail === undefined ? { error: message } : { error: message, detail };
+  return error instanceof FutuurError ? { error: message, detail: error.body } : { error: message };
 }
 
 function json(statusCode: number, body: unknown): APIGatewayProxyResultV2 {
