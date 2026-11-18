@@ -74,17 +74,26 @@ export default $config({
     // Failed cron invocations land here after the scheduler exhausts its retries.
     const dlq = new sst.aws.Queue("BetDlq");
 
-    // The assets the 5-minute bot plays, each with its own bankroll: keys from
-    // src/assets.ts. Shared with the API so the dashboard offers a page for each.
+    // The markets the bot plays: these coins in these timeframes, each pair with its
+    // own bankroll (src/assets.ts). Shared with the API so the dashboard offers a page
+    // for each.
     const fiveMinAssets = "btc,eth,sol";
+    const fiveMinTimeframes = "5m,15m,1h,1d";
+    // Seconds before the close the bot looks at each market: it may buy at the first,
+    // and top up or sell at the later ones (src/fivemin.ts play). Earlier looks are
+    // less certain but may find the cheap ladder before the maker reprices it; every
+    // look is recorded in the round's `steps`.
+    const fiveMinCheckpoints = "45,30,15";
 
-    // Futuur's "Up or Down — 5 min" markets, bet in their last seconds. Fires at
-    // minute 4 of every 5-minute window — one minute before the close — settles the
-    // rounds that resolved since, then sleeps until FIVEMIN_DECIDE_AT seconds before
-    // the close and decides. See src/fivemin.ts.
+    // Futuur's "Up or Down" markets, bet in their last seconds. Fires at minute 3 of
+    // every 5-minute window — EventBridge Scheduler delivers it ~39s late, so about 80s
+    // before the close, in time for a 45s checkpoint — settles the rounds that
+    // resolved since, then looks at each FIVEMIN_CHECKPOINTS moment before the close and
+    // decides. See src/fivemin.ts.
     //
-    // One function plays every asset, side by side: their windows close at the same
-    // instant, so a Lambda per asset would triple the invocations for the same wait.
+    // One function plays every market, side by side. Every timeframe closes on a
+    // 5-minute boundary — 15 min on the quarter hour, 1 hour on the hour, daily at
+    // 12:00 PM ET — so each run plays the markets closing at that one.
     // The resource keeps its Bitcoin-only name so the schedule is not recreated.
     //
     // This replaced the hourly Claude agent. An LLM turn takes longer than the window
@@ -93,7 +102,7 @@ export default $config({
     // `retries: 0` on purpose: a retry would re-enter a window the first attempt may
     // already have bet in.
     const fiveMin = new sst.aws.CronV2("FiveMinuteBitcoinBet", {
-      schedule: "cron(4/5 * * * ? *)",
+      schedule: "cron(3/5 * * * ? *)",
       timezone: "UTC",
       retries: 0,
       dlq: dlq.arn,
@@ -102,12 +111,13 @@ export default $config({
         environment: {
           ...futuur,
           FIVEMIN_ASSETS: fiveMinAssets,
-          // Starting bankroll of each asset. Read only when that asset's ledger
-          // (pk FIVEMIN, sk STATE / STATE#ETH / STATE#SOL) is created on its first
-          // run; after that the ledger is the truth.
+          FIVEMIN_TIMEFRAMES: fiveMinTimeframes,
+          // Starting bankroll of each market. Read only when that market's ledger
+          // (pk FIVEMIN, sk STATE / STATE#ETH / STATE#1H#BTC…) is created on its
+          // first run; after that the ledger is the truth.
           FIVEMIN_BUDGET: "10000",
-          // Decide 15s before the close; never place an order with under 4s left.
-          FIVEMIN_DECIDE_AT: "15",
+          // Never place an order with under 4s left.
+          FIVEMIN_CHECKPOINTS: fiveMinCheckpoints,
           FIVEMIN_LATEST_AT: "4",
           // Only buy ask levels at least 5 points below the model's probability, and
           // only when the favoured side is at least 70% likely.
@@ -128,8 +138,8 @@ export default $config({
         },
         link: [memory],
         ...runtime,
-        // From :X4:00 to the close plus settling and recording.
-        timeout: "2 minutes",
+        // From ~:X3:39 to the close plus settling and recording.
+        timeout: "3 minutes",
       },
     });
 
@@ -140,7 +150,12 @@ export default $config({
 
     const onDemand = {
       handler: "src/api.handler",
-      environment: { ...betting, FIVEMIN_ASSETS: fiveMinAssets },
+      environment: {
+        ...betting,
+        FIVEMIN_ASSETS: fiveMinAssets,
+        FIVEMIN_TIMEFRAMES: fiveMinTimeframes,
+        FIVEMIN_CHECKPOINTS: fiveMinCheckpoints,
+      },
       link: [memory],
       ...runtime,
     };

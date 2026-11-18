@@ -12,8 +12,9 @@ more — see [The hourly agent](#the-hourly-agent) below.
 
 ## The 5-minute bot
 
-`src/fivemin.ts`, on `cron(4/5 * * * ? *)` — minute 4 of every 5-minute window, one
-minute before the close. Each run:
+`src/fivemin.ts`, on `cron(3/5 * * * ? *)` — minute 3 of every 5-minute window.
+EventBridge Scheduler delivers it about 39 seconds late, every time, so the run starts
+~80 seconds before the close: enough for the first checkpoint at 45s. Each run:
 
 1. **Settles** every pending round that has resolved, with Futuur's own P&L off the wager,
    and credits it back to the ledger. Pending rounds are found through a marker item
@@ -22,7 +23,7 @@ minute before the close. Each run:
    **splits the wallet** between the assets in proportion to their ledgers.
 3. **Warms up** 3 seconds before deciding: fetches volatility and touches both books,
    which also opens the TLS connections to Binance and Futuur.
-4. **Reads**, at `FIVEMIN_DECIDE_AT` (15) seconds before the close and in one round
+4. **Reads**, at each checkpoint (`FIVEMIN_CHECKPOINTS`, see below) and in one round
    trip, the pair's Binance 5m candle in progress — the exact candle Futuur settles
    on — and the book of both sides. The candle's open must equal the event's price to
    beat (the line check, within 0.0015% of the price), and its latest close is where
@@ -60,6 +61,64 @@ no two assets can count the same money.
 `FIVEMIN_ASSETS` (`btc,eth,sol`) picks which ones run. Every other setting below is
 shared by all of them.
 
+### Timeframes
+
+Futuur runs the same product at 15 minutes, 1 hour and daily too, and the bot plays
+those as well (`FIVEMIN_TIMEFRAMES`, `5m,15m,1h,1d`). Every close falls on a 5-minute
+boundary, so the same schedule plays them: each run looks for events only in the
+timeframes that can close at its window, and plays them side by side with the 5-minute
+ones. Every market — a coin in a timeframe — has its own ledger and rounds, and the
+shared wallet is split between whichever markets bet at that instant.
+
+| Timeframe | Closes | Settles on | Categories (BTC / ETH / SOL) | Keys | Dashboard |
+| --- | --- | --- | --- | --- | --- |
+| 5 min | every 5 min | Binance 5m candle, close ≥ open | 3728 / 3729 / 3731 | `ROUND5`, `STATE` (+`#ETH`, `#SOL`) | `/`, `/eth`, `/sol` |
+| 15 min | :00 :15 :30 :45 | Binance 15m candle, close ≥ open | 3733 / 3735 / 3734 | `ROUND#15M#BTC`, `STATE#15M#BTC` | `/btc-15m`… |
+| 1 hour | on the hour | Binance 1h candle, close ≥ open | 3702 / 3730 / 3732 | `ROUND#1H#BTC`, `STATE#1H#BTC` | `/btc-1h`… |
+| Daily | 12:00 PM ET | close of the 12:00 PM ET 1m candle ≥ yesterday's | 3689 / 3736 / 3737 | `ROUND#1D#BTC`, `STATE#1D#BTC` | `/btc-1d`… |
+
+The strategy is the same everywhere — the side spot is on, in the last seconds, only at
+prices with edge — with two differences on the daily market:
+
+- **The line** is the close of yesterday's 12:00 PM ET minute (`event_extra_data.price_1`),
+  not a candle open. It is checked against Binance's 1m candle at `price_1_date` during
+  the warm-up, off the hot path.
+- **The settling price is fixed a minute after betting closes**: betting ends at 12:00 PM
+  ET, when that minute candle *opens*. The model prices the seconds left plus those 60
+  seconds (`settleLagSec` on the round), so it is less sure — and bets less — than it
+  would be with the same gap on the shorter markets.
+
+Markets on the same coin that close together are correlated when their lines are close:
+a late move across both lines loses both rounds. Kelly sizes each market on its own, so
+half Kelly is also the cushion for that.
+
+### Checkpoints: buying earlier, topping up, selling
+
+On the evening of 17 Nov 2026 (~22:00 UTC) the ladder changed: the best ask at 15s left
+went from 0.53–0.74 to ~0.80, and what sits below the bot's limit fell from ~50,000
+shares to ~2,000 — the stake per round fell from ~45,000 to ~1,600 OOM at the same win
+rate. Whoever quotes it now reprices near the close (`scripts/pnl-by-day.mjs`).
+
+So the bot looks more than once (`FIVEMIN_CHECKPOINTS`, `45,30,15`). At each look it
+re-prices both sides with the model for the seconds left and:
+
+- **buys** the side spot is on if nothing is held, at the levels with edge (`planOrder`);
+- **tops up** that side while the edge is there, under one Kelly cap for the whole
+  position (`planOrder` with `held`);
+- **sells** held shares to bids at least `FIVEMIN_MIN_EDGE` above what the model says
+  they are worth (`planSell`) — after the price crosses the line, or when the bids
+  reprice above it. A side that is still likely to win is never sold cheap.
+
+Earlier is less certain, and the model prices that: on a day of Binance seconds, the
+side spot is on at 45s left flipped by the close in 11.5% of windows (5.6% at 15s), and
+in every bucket the model was, if anything, under-confident. Every look is recorded in
+the round's `steps` — the top of both books, spot, the probability and what was done —
+so the checkpoints can be tuned on what the book really does in the last minute.
+
+A sale is credited to the bankroll at once. A round that sold anything settles on its own
+fills — payout of the shares still held + proceeds − cost — and counts as won or lost by
+that P&L, so a sale that cut a loss is a loss.
+
 ### Why the end of the window
 
 Watched live, Futuur's book on this market is a static ladder centred on 0.50 —
@@ -86,17 +145,18 @@ after.
 
 | Where | What |
 | --- | --- |
-| `GET /`, `/eth`, `/sol` | One asset's ledger and every round, refreshing every 30s |
-| `GET /rounds?asset=eth&limit=N` | The same as JSON (default Bitcoin, 288 = one day) |
+| `GET /`, `/eth`, `/sol`, `/btc-15m`, `/eth-1h`, `/sol-1d`… | One market's ledger and every round, refreshing every 30s |
+| `GET /rounds?asset=eth-1h&limit=N` | The same as JSON (default Bitcoin 5 min, 288 = one day) |
 | CloudWatch, `FiveMinuteBitcoinBet` | `bet placed` / `skipped` / `settled` log lines per run, for every asset |
 
 ### Configuration
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `FIVEMIN_ASSETS` | `btc,eth,sol` | Which assets to play |
-| `FIVEMIN_BUDGET` | `10000` | Starting bankroll of each asset, only read when its ledger is created |
-| `FIVEMIN_DECIDE_AT` | `15` | Seconds before the close to decide |
+| `FIVEMIN_ASSETS` | `btc,eth,sol` | Which coins to play |
+| `FIVEMIN_TIMEFRAMES` | `5m,15m,1h,1d` | Which timeframes to play |
+| `FIVEMIN_BUDGET` | `10000` | Starting bankroll of each market, only read when its ledger is created |
+| `FIVEMIN_CHECKPOINTS` | `FIVEMIN_DECIDE_AT`, `15` | Seconds before the close to look at the market; deployed as `45,30,15` |
 | `FIVEMIN_LATEST_AT` | `4` | Skip if fewer seconds than this are left |
 | `FIVEMIN_MIN_PROB` | `0.7` | Skip below this probability for the favoured side |
 | `FIVEMIN_MIN_EDGE` | `0.05` | Only buy levels at least this far below the probability |

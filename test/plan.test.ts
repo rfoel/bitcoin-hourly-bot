@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { allocate, planOrder } from "../src/plan.ts";
+import { allocate, planOrder, planSell } from "../src/plan.ts";
 
 const ladder = [
   { price: 0.52, total_shares: 1155 },
@@ -44,6 +44,47 @@ describe("planOrder", () => {
     const asks = ladder.map((l) => ({ ...l }));
     planOrder(asks, 0.9, 1_000, { minEdge: 0.05, kelly: 1 });
     assert.deepEqual(asks, ladder);
+  });
+
+  it("tops up a held position only to the Kelly cap of the whole position", () => {
+    const cfg = { minEdge: 0.05, kelly: 0.5 };
+    const once = planOrder(ladder, 0.9, 1_000, cfg);
+    const firstHalf = planOrder(ladder, 0.9, 1_000 / 2, cfg);
+    const topUp = planOrder(ladder, 0.9, 1_000, cfg, { shares: firstHalf.shares, cost: firstHalf.cost });
+    assert.ok(topUp.shares > 0);
+    const cost = firstHalf.cost + topUp.cost;
+    const avg = cost / (firstHalf.shares + topUp.shares);
+    const cap = 1_000 * ((0.9 - avg) / (1 - avg)) * cfg.kelly;
+    assert.ok(cost <= cap + 1e-9, `${cost} > ${cap}`);
+    assert.ok(Math.abs(cost - once.cost) / once.cost < 0.01, `${cost} vs ${once.cost}`);
+
+    // A position already past the cap buys nothing more.
+    const over = planOrder(ladder, 0.9, 1_000, cfg, { shares: 1_000, cost: 600 });
+    assert.equal(over.shares, 0);
+  });
+});
+
+describe("planSell", () => {
+  const bids = [
+    { price: 0.4, total_shares: 100 },
+    { price: 0.6, total_shares: 50 },
+    { price: 0.5, total_shares: 80 },
+  ];
+
+  it("sells highest bids first, only at least minEdge above what the shares are worth", () => {
+    const sell = planSell(bids, 0.42, 1_000, { minEdge: 0.05 });
+    assert.equal(sell.minPrice, 0.47);
+    assert.equal(sell.shares, 130);
+    assert.equal(sell.limit, 0.5);
+    assert.equal(sell.proceeds, 50 * 0.6 + 80 * 0.5);
+  });
+
+  it("never sells more than is held", () => {
+    assert.equal(planSell(bids, 0.1, 70, { minEdge: 0.05 }).shares, 70);
+  });
+
+  it("holds a side still worth more than the bids pay", () => {
+    assert.equal(planSell(bids, 0.9, 1_000, { minEdge: 0.05 }).shares, 0);
   });
 });
 

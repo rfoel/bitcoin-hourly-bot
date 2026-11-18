@@ -13,16 +13,21 @@ export interface Plan {
  * Walks the ask ladder, cheapest first, buying only levels at least `minEdge` below
  * `prob`. The stake is capped by Kelly on the running average price — f = (p − q)/(1 − q)
  * — so it goes all-in only when that is what the edge justifies.
+ *
+ * `held` is a position already bought on this side earlier in the window: the Kelly cap
+ * applies to the whole position, so topping it up never stakes more than one buy would.
+ * The plan returned is only the new shares.
  */
 export function planOrder(
   asks: Pick<OrderBookLevel, "price" | "total_shares">[],
   prob: number,
   bankroll: number,
   cfg: { minEdge: number; kelly: number },
+  held: { shares: number; cost: number } = { shares: 0, cost: 0 },
 ): Plan {
   const maxPrice = round2(prob - cfg.minEdge);
-  let shares = 0;
-  let cost = 0;
+  let shares = held.shares;
+  let cost = held.cost;
   let limit = 0;
   let levels = 0;
 
@@ -44,14 +49,53 @@ export function planOrder(
     levels += 1;
   }
 
+  const bought = shares - held.shares;
+  const spent = cost - held.cost;
   return {
-    shares,
+    shares: bought,
     limit,
-    cost: round2(cost),
-    avgPrice: shares > 0 ? round4(cost / shares) : 0,
+    cost: round2(spent),
+    avgPrice: bought > 0 ? round4(spent / bought) : 0,
     maxPrice,
     levels,
   };
+}
+
+export interface SellPlan {
+  shares: number;
+  /** Lowest bid touched: the limit that crosses every level in the plan. */
+  limit: number;
+  proceeds: number;
+  minPrice: number;
+}
+
+/**
+ * Walks the bid ladder, highest first, selling held shares only to bids at least
+ * `minEdge` above `prob` — where cashing out is worth more than holding to the close.
+ * A side that is still likely to win is never sold cheap: if the bids sit below what
+ * the shares are worth, the plan is empty and the position rides.
+ */
+export function planSell(
+  bids: Pick<OrderBookLevel, "price" | "total_shares">[],
+  prob: number,
+  held: number,
+  cfg: { minEdge: number },
+): SellPlan {
+  const minPrice = round2(prob + cfg.minEdge);
+  let shares = 0;
+  let proceeds = 0;
+  let limit = 0;
+
+  for (const level of [...bids].sort((a, b) => b.price - a.price)) {
+    if (level.price < minPrice) break;
+    const take = Math.min(Math.floor(level.total_shares), Math.floor(held - shares));
+    if (take < 1) break;
+    shares += take;
+    proceeds += take * level.price;
+    limit = level.price;
+  }
+
+  return { shares, limit, proceeds: round2(proceeds), minPrice };
 }
 
 /**

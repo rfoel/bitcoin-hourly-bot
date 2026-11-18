@@ -32,8 +32,8 @@ export const handler = async (
       return denied(event, path);
     }
 
-    // The 5-minute dashboard, one page per asset: `/` is the first asset (Bitcoin),
-    // `/eth` and `/sol` the others.
+    // The dashboard, one page per market: `/` is Bitcoin 5 min, `/eth` and `/sol` the
+    // other 5-minute ones, `/btc-15m`, `/eth-1h`, `/sol-1d`… the other timeframes.
     const assets = enabledAssets();
     const page =
       method !== "GET" ? undefined
@@ -52,7 +52,7 @@ export const handler = async (
       case "GET /health":
         return json(200, { ok: true });
 
-      // Every 5-minute round of one asset (`?asset=eth`, Bitcoin by default), bet or
+      // Every round of one market (`?asset=eth-1h`, Bitcoin 5 min by default), bet or
       // skipped, with what the bot saw and why it decided.
       case "GET /rounds": {
         const asset = assetParam(event);

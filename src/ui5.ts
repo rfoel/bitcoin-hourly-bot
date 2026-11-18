@@ -26,13 +26,16 @@ import type { Ledger, RoundRecord } from "./rounds.js";
 export interface RoundsView {
   /** Only rounds where the bot actually bet. */
   onlyBets?: boolean;
-  /** Every asset the bot plays, for the switcher. The first one lives at `/`. */
+  /** Every market the bot plays, for the switchers. The first one lives at `/`. */
   assets?: Asset[];
 }
 
 const TZ = "America/Sao_Paulo";
 const MIN_PROB = Number(process.env.FIVEMIN_MIN_PROB ?? "0.7");
-const DECIDE_AT = Number(process.env.FIVEMIN_DECIDE_AT ?? "15");
+/** The earliest look before the close: from there on the bot may act. */
+const DECIDE_AT = Math.max(
+  ...(process.env.FIVEMIN_CHECKPOINTS ?? process.env.FIVEMIN_DECIDE_AT ?? "15").split(",").map(Number).filter((s) => s > 0),
+);
 const WINDOW_MS = 300_000;
 const HOURS = 24;
 
@@ -45,6 +48,14 @@ export function renderRounds(
   const assets = view.assets ?? [asset];
   const pathOf = (a: Asset) => (a.key === assets[0]?.key ? "/" : `/${a.key}`);
   const home = pathOf(asset);
+  // Two switchers: the coin in this timeframe, and this coin in every timeframe.
+  const coins = assets.filter((a) => a.timeframe.key === asset.timeframe.key);
+  const timeframes = assets.filter((a) => a.coin === asset.coin);
+  const pills = (list: Asset[], label: string, text: (a: Asset) => string) =>
+    list.length > 1
+      ? `<nav class="pills" aria-label="${label}">${list.map((a) => `<a href="${pathOf(a)}" ${a.key === asset.key ? 'aria-current="true"' : ""}>${esc(text(a))}</a>`).join("")}</nav>`
+      : "";
+  const fiveMinutes = asset.timeframe.key === "5m";
   const settled = rounds
     .filter((r) => r.status === "won" || r.status === "lost")
     .sort((a, b) => a.closesAt.localeCompare(b.closesAt));
@@ -59,21 +70,22 @@ export function renderRounds(
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <noscript><meta http-equiv="refresh" content="30"></noscript>
-<title>${equity === null ? "" : `${int(equity)} OOM · `}${esc(asset.name)} 5 min</title>
+<title>${equity === null ? "" : `${int(equity)} OOM · `}${esc(asset.name)} ${esc(asset.timeframe.label)}</title>
 <style>${CSS}</style>
 </head>
 <body>
 <main>
   <header class="bar">
     <div class="eyebrow"><span class="live" aria-hidden="true"></span> Ao vivo · OOM de mentira</div>
-    ${assets.length > 1 ? `<nav class="pills" aria-label="Mercado">${assets.map((a) => `<a href="${pathOf(a)}" ${a.key === asset.key ? 'aria-current="true"' : ""}>${esc(a.name)}</a>`).join("")}</nav>` : ""}
+    ${pills(coins, "Moeda", (a) => a.name)}
+    ${pills(timeframes, "Prazo", (a) => a.timeframe.label)}
   </header>
 
   <section class="card top" id="live-hero" data-live>
     ${ledger === null ? emptyState() : hero(asset, ledger, equity!, atStake)}
   </section>
 
-  ${now(asset, rounds)}
+  ${fiveMinutes ? now(asset, rounds) : ""}
 
   <div id="live-body" data-live>
     <section class="card">
@@ -87,7 +99,7 @@ export function renderRounds(
           <span class="muted">tamanho = quanto apostou</span>
         </div>
       </div>
-      ${dayGrid(rounds)}
+      ${dayGrid(rounds, asset.timeframe.durationMs)}
     </section>
 
     <section class="card">
@@ -120,7 +132,7 @@ function hero(asset: Asset, ledger: Ledger, equity: number, atStake: number): st
   const decided = ledger.won + ledger.lost;
 
   return `<div>
-      <div class="k">Banca · ${esc(asset.name)}</div>
+      <div class="k">Banca · ${esc(asset.name)} ${esc(asset.timeframe.label)}</div>
       <div class="hero-value">${big(equity)} <span class="unit">OOM</span></div>
       <div class="delta ${pnl >= 0 ? "up" : "down"}">
         <span aria-hidden="true">${pnl >= 0 ? "▲" : "▼"}</span>
@@ -208,7 +220,7 @@ function slotOf(r: RoundRecord): number {
  * windows are exactly one of its hours), the current hour on the right. Under the dots,
  * each hour's settled result as a bar.
  */
-function dayGrid(rounds: RoundRecord[]): string {
+function dayGrid(rounds: RoundRecord[], durationMs: number): string {
   const nowSlot = Math.floor(Date.now() / WINDOW_MS);
   const nowHour = Math.floor(nowSlot / 12);
   const bySlot = new Map(rounds.map((r) => [slotOf(r), r]));
@@ -229,7 +241,9 @@ function dayGrid(rounds: RoundRecord[]): string {
       if (k > nowSlot) continue;
       const cx = L + col * C + C / 2, cy = top + row * C + C / 2;
       const r = bySlot.get(k);
-      const win = `${timeFmt.format((k) * WINDOW_MS)}–${timeFmt.format((k + 1) * WINDOW_MS)}`;
+      // A round sits on the 5-minute slot it closes in; its window may be longer.
+      const end = (k + 1) * WINDOW_MS;
+      const win = `${timeFmt.format(end - durationMs)}–${timeFmt.format(end)}`;
       if (k === nowSlot && !r) {
         cells.push(`<circle class="dot-now" cx="${cx}" cy="${cy}" r="10"/><rect class="hit" x="${cx - C / 2}" y="${cy - C / 2}" width="${C}" height="${C}" data-a="${win}" data-b="Janela aberta agora"/>`);
         continue;
@@ -265,7 +279,7 @@ function dayGrid(rounds: RoundRecord[]): string {
     `<text class="tick" x="${L - 8}" y="${top + row * C + C / 2 + 4}" text-anchor="end">:${String(row * 5).padStart(2, "0")}</text>`).join("");
 
   const count = (s: string) => rounds.filter((r) => r.status === s).length;
-  const label = `Últimas 24 horas, um ponto por janela de 5 minutos: ${count("won")} apostas ganhas, ${count("lost")} perdidas, ${count("skipped")} rodadas puladas.`;
+  const label = `Últimas 24 horas, um ponto por rodada, na hora em que fechou: ${count("won")} apostas ganhas, ${count("lost")} perdidas, ${count("skipped")} rodadas puladas.`;
 
   return `<figure class="grid24">
     <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(label)}">
@@ -281,7 +295,8 @@ function dayGrid(rounds: RoundRecord[]): string {
 function tipOf(r: RoundRecord): [string, string] {
   const side = r.side === "down" ? "↓ Desce" : "↑ Sobe";
   const stake = r.cost ?? 0;
-  const pick = `${side} · ${chance(r.prob ?? 0)} · ${big(stake)} OOM`;
+  const sold = r.sharesSold ? ` · vendeu ${big(r.sharesSold)} antes por ${big(r.proceeds ?? 0)}` : "";
+  const pick = `${side} · ${chance(r.prob ?? 0)} · ${big(stake)} OOM${sold}`;
   switch (r.status) {
     case "won": return [`Ganhou ${signedBig(r.pnl ?? 0)}`, pick];
     case "lost": return [`Perdeu ${big(Math.abs(r.pnl ?? stake))}`, pick];

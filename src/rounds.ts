@@ -12,13 +12,15 @@ import { Resource } from "sst";
 import type { Asset } from "./assets.js";
 
 /**
- * The 5-minute bot's own records, in the same table as the hourly ones. One ledger and
- * one set of rounds per asset (see src/assets.ts for each asset's keys):
+ * The bot's own records, in the same table as the hourly agent's. One ledger and one
+ * set of rounds per market — a coin in a timeframe (see src/assets.ts for the keys):
  *
  *   pk `ROUND5`      sk `<betEndDate>`  — Bitcoin: one row per round, bet or skipped
  *   pk `ROUND5#ETH`  sk `<betEndDate>`  — the same for Ethereum (`#SOL` for Solana)
  *   pk `FIVEMIN`     sk `STATE`         — Bitcoin's bankroll ledger
  *   pk `FIVEMIN`     sk `STATE#ETH`     — Ethereum's (`STATE#SOL` for Solana)
+ *   pk `ROUND#15M#BTC` sk `<betEndDate>` — the other timeframes (15M, 1H, 1D) and
+ *   pk `FIVEMIN`     sk `STATE#15M#BTC` — coins, each with its rounds and its ledger
  *   pk `PENDING#<rounds pk>` sk `<betEndDate>` — a copy of each round still pending,
  *                                       so settling reads only those instead of days
  *                                       of rounds. Written and removed in the same
@@ -63,9 +65,17 @@ export interface RoundRecord {
   /** When the decision was made, and how close to the close that was. */
   decidedAt?: string;
   secondsLeft?: number;
+  /**
+   * Seconds between the betting close and the settling price: 60 on the daily market,
+   * absent elsewhere. The model priced secondsLeft plus this.
+   */
+  settleLagSec?: number;
 
   priceToBeat?: number;
-  /** Open of the Binance 5m candle Futuur settles against — should equal priceToBeat. */
+  /**
+   * The line as Binance has it — the candle's open, or the daily market's minute close —
+   * which should equal priceToBeat.
+   */
   binanceOpen?: number;
   spot?: number;
   gap?: number;
@@ -103,6 +113,17 @@ export interface RoundRecord {
   /** Round trip of the order request(s), in ms. */
   orderMs?: number;
 
+  /**
+   * Shares sold back before the close, and what they brought — already credited to the
+   * bankroll when sold. When present, `shares` is what was still held at the close and
+   * `cost` everything bought, and the round settles on its own numbers rather than
+   * Futuur's wager profit.
+   */
+  sharesSold?: number;
+  proceeds?: number;
+  /** Every look at the market in the window, and what the bot did on it. */
+  steps?: RoundStep[];
+
   /** Filled in when the round settles. */
   resolution?: string | null;
   closePrice?: number;
@@ -110,6 +131,26 @@ export interface RoundRecord {
   pnl?: number;
   bankrollAfter?: number;
   settledAt?: string;
+}
+
+export interface RoundStep {
+  /** Seconds before the close. */
+  secondsLeft: number;
+  spot: number;
+  probUp: number;
+  /** Top of both books: best ask and best bid for each side. */
+  upAsk: number | null;
+  upBid: number | null;
+  downAsk: number | null;
+  downBid: number | null;
+  action: "none" | "buy" | "sell";
+  side?: "up" | "down";
+  shares?: number;
+  /** Cost of a buy, proceeds of a sell. */
+  amount?: number;
+  price?: number;
+  orderId?: number;
+  note?: string;
 }
 
 export interface Ledger {
@@ -165,8 +206,11 @@ export async function loadLedger(asset: Asset, budget: number): Promise<Ledger> 
   return (again.Item as Ledger) ?? ledger;
 }
 
-/** Holds a bet's cost out of the bankroll until it settles. */
-export async function reserve(asset: Asset, cost: number): Promise<Ledger> {
+/**
+ * Holds a bet's cost out of the bankroll until it settles. A top-up of a position already
+ * opened in the same window holds its cost too, but is not another bet.
+ */
+export async function reserve(asset: Asset, cost: number, { newBet = true } = {}): Promise<Ledger> {
   const result = await client.send(
     new UpdateCommand({
       TableName: table(),
@@ -174,9 +218,26 @@ export async function reserve(asset: Asset, cost: number): Promise<Ledger> {
       UpdateExpression: "SET bankroll = bankroll - :cost, bets = bets + :one, updatedAt = :now",
       ExpressionAttributeValues: {
         ":cost": cost,
-        ":one": 1,
+        ":one": newBet ? 1 : 0,
         ":now": new Date().toISOString(),
       },
+      ReturnValues: "ALL_NEW",
+    }),
+  );
+  return result.Attributes as Ledger;
+}
+
+/**
+ * Credits what a sale before the close brought in, at once: the money is back in the
+ * wallet, so it is back in the bankroll. Settling then releases only what is still held.
+ */
+export async function credit(asset: Asset, amount: number): Promise<Ledger> {
+  const result = await client.send(
+    new UpdateCommand({
+      TableName: table(),
+      Key: ledgerKey(asset),
+      UpdateExpression: "SET bankroll = bankroll + :amount, updatedAt = :now",
+      ExpressionAttributeValues: { ":amount": round2(amount), ":now": new Date().toISOString() },
       ReturnValues: "ALL_NEW",
     }),
   );
