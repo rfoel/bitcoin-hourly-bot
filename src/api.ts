@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from "aws-lambda";
 import { FutuurError } from "futuur";
 import { assetOf, DEFAULT_ASSET, enabledAssets } from "./assets.js";
@@ -6,6 +6,7 @@ import type { Asset } from "./assets.js";
 import { placeBet, walletBalance } from "./bet.js";
 import type { BetOverrides } from "./bet.js";
 import { listBets, listNotes, listRuns, putNote, summarise, summariseSpend } from "./store.js";
+import { denied, handleAuth, hasSession, isPublicRoute } from "./passkey.js";
 import { getLedger, listRounds } from "./rounds.js";
 import { renderPage } from "./ui.js";
 import { renderRounds } from "./ui5.js";
@@ -19,12 +20,18 @@ export const handler = async (
   const path = (event.rawPath ?? "/").replace(/\/+$/, "") || "/";
   const route = `${method} ${path}`;
 
-  // Reads are public — this is a dashboard. Only the two routes that spend money
-  // or write to the store need the token.
-  const writes = route === "POST /bet" || route === "POST /notes";
-  if (writes && !authorized(event)) return json(401, { error: "unauthorized" });
-
   try {
+    // Sign-in pages and the WebAuthn ceremony, before any gate.
+    const auth = await handleAuth(event, method, path);
+    if (auth) return auth;
+
+    // Everything else opens only with a passkey session — Face ID / Touch ID, see
+    // src/passkey.ts. The session cookie is SameSite=Lax, so another site cannot
+    // fire the two write routes with it.
+    if (!isPublicRoute(method, path) && !(await hasSession(event))) {
+      return denied(event, path);
+    }
+
     // The 5-minute dashboard, one page per asset: `/` is the first asset (Bitcoin),
     // `/eth` and `/sol` the others.
     const assets = enabledAssets();
@@ -178,21 +185,6 @@ function tagsOf(value: unknown): string[] {
   }
   if (Array.isArray(value)) return value.filter((tag): tag is string => typeof tag === "string");
   throw new RequestError("tags must be an array or a comma-separated string");
-}
-
-/** Shared-secret check. Fails closed if the token was never set. */
-function authorized(event: APIGatewayProxyEventV2): boolean {
-  const expected = process.env.API_TOKEN;
-  if (!expected) return false;
-
-  const headers = event.headers ?? {};
-  const supplied =
-    headers.authorization?.replace(/^Bearer\s+/i, "").trim() || headers["x-api-key"]?.trim();
-  if (!supplied) return false;
-
-  const a = Buffer.from(supplied);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /** Overrides come from the JSON body, falling back to the query string. */

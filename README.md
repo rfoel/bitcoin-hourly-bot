@@ -161,13 +161,12 @@ Lambda `nodejs24.x` on arm64, region `sa-east-1`.
 pnpm install
 pnpm sst secret set FutuurPublicKey  <your-public-key>  --stage production
 pnpm sst secret set FutuurPrivateKey <your-private-key> --stage production
-pnpm sst secret set ApiToken "$(openssl rand -hex 32)"  --stage production
 pnpm sst secret set Domain           <dashboard-hostname>  --stage production
 pnpm sst deploy --stage production
 ```
 
-Secrets are per stage. Without `ApiToken` the two write endpoints reject everything;
-the dashboard and the read endpoints do not need it.
+Secrets are per stage. Right after the first deploy, open `/registrar` and enrol your
+device: the first passkey claims the app (see [Passkeys](#passkeys)).
 
 ### Domain
 
@@ -304,14 +303,36 @@ Runs where Claude passed appear too, so you can see what it decided *not* to do.
 
 | Route | Auth |
 | --- | --- |
-| `GET /` · `/state` · `/bets` · `/stats` · `/runs` · `/notes` · `/health` | public |
-| `POST /bet` · `POST /notes` | `Authorization: Bearer $TOKEN` |
+| `GET /health` · `/entrar` · `/registrar` · `POST /auth/*` | public |
+| everything else, reads and writes | passkey session |
 
-```bash
-curl -sX POST https://bitcoin.rfoel.dev/bet \
-  -H "Authorization: Bearer $TOKEN" \
-  -H 'content-type: application/json' \
-  -d '{"dryRun": true}' | jq
+### Passkeys
+
+Face ID / Touch ID is the only way in (WebAuthn, `src/passkey.ts`) — there is no
+password or API token. A browser without a session is sent to `/entrar`; anything that
+is not a page gets a 401.
+
+- **Enrol a device** at `/registrar`. While no passkey exists, anyone reaching it claims
+  the app, so do it right after the first deploy. After that it only works from a
+  signed-in browser. Passkeys synced through iCloud Keychain work on every Apple device
+  without enrolling again; on another computer, sign in with the phone (QR code), then
+  enrol it.
+- **Storage**: same table. `pk PASSKEY` `sk <credential id>` per device — delete the row
+  to revoke it. `pk CONFIG` `sk SESSION_KEY` holds the random cookie key, created on
+  first use.
+- **Session**: a signed `sessao` cookie, `PASSKEY_SESSION_HOURS` long (12 by default).
+  The WebAuthn challenge is a signed cookie too, so there is no server-side state to
+  expire. **Deleting the `SESSION_KEY` row and redeploying signs every browser out**
+  (the passkeys themselves stay valid).
+- Locked out (every passkey lost)? Delete all `PASSKEY` rows and `/registrar` is open
+  again for the first device.
+- The passkey is bound to the hostname (`Domain`), so a stage on another host needs its
+  own enrolment.
+
+From a signed-in tab's console:
+
+```js
+await (await fetch("/bet", { method: "POST", body: JSON.stringify({ dryRun: true }) })).json()
 ```
 
 `POST /bet` runs the deterministic `spot` strategy, not the agent — it is for testing the

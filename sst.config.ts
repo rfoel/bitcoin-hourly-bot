@@ -15,8 +15,6 @@ export default $config({
   async run() {
     const publicKey = new sst.Secret("FutuurPublicKey");
     const privateKey = new sst.Secret("FutuurPrivateKey");
-    // Shared secret for the on-demand endpoint. Without it the API rejects everything.
-    const apiToken = new sst.Secret("ApiToken");
 
     // Not a secret, but SST's per-stage config value. No default on purpose: every
     // stage states its own hostname, so a deploy can never inherit another stage's
@@ -142,7 +140,7 @@ export default $config({
 
     const onDemand = {
       handler: "src/api.handler",
-      environment: { ...betting, API_TOKEN: apiToken.value, FIVEMIN_ASSETS: fiveMinAssets },
+      environment: { ...betting, FIVEMIN_ASSETS: fiveMinAssets },
       link: [memory],
       ...runtime,
     };
